@@ -1,0 +1,74 @@
+# 第一阶段：构建 derper
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+
+ENV CGO_ENABLED=0 \
+    GOOS=linux
+
+RUN apk add --no-cache git && \
+    git clone --depth 1 https://github.com/tailscale/tailscale.git . && \
+    sed -i '/if hi.ServerName != m.hostname && !m.noHostname {/,/}/ s/^/\/\//' cmd/derper/cert.go
+
+WORKDIR /app/cmd/derper
+RUN go build -ldflags="-s -w" -o /app/derper .
+
+# 第二阶段：构建 tailscale 组件
+FROM golang:1.26-alpine AS build-env
+
+WORKDIR /go/src/tailscale
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 预构建依赖以利用缓存
+RUN go install \
+    github.com/aws/aws-sdk-go-v2/aws \
+    github.com/aws/aws-sdk-go-v2/config \
+    gvisor.dev/gvisor/pkg/tcpip/adapters/gonet \
+    gvisor.dev/gvisor/pkg/tcpip/stack \
+    golang.org/x/crypto/ssh \
+    golang.org/x/crypto/acme \
+    github.com/coder/websocket \
+    github.com/mdlayher/netlink
+
+COPY . .
+
+ARG VERSION_LONG="" \
+    VERSION_SHORT="" \
+    VERSION_GIT_HASH="" \
+    TARGETARCH=amd64
+
+RUN GOARCH=$TARGETARCH go install -ldflags="\
+      -X tailscale.com/version.longStamp=$VERSION_LONG \
+      -X tailscale.com/version.shortStamp=$VERSION_SHORT \
+      -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
+      -v ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot
+
+# 第三阶段：最终镜像
+FROM alpine:3.22
+
+# 合并所有安装和配置，减少镜像层
+RUN apk add --no-cache \
+        ca-certificates \
+        iptables \
+        iproute2 \
+        ip6tables \
+        curl \
+        nftables \
+        python3 \
+        bash \
+        tzdata \
+        py3-netifaces \
+        py3-yaml \
+        py3-schedule && \
+    # iptables legacy 兼容 (Alpine 3.19+ 使用 nftables 实现)
+    ln -sf iptables-legacy /usr/sbin/iptables && \
+    ln -sf ip6tables-legacy /usr/sbin/ip6tables && \
+    # 时区设置
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    # 创建运行目录
+    mkdir /tailscale && \
+    ln -s /usr/local/bin/containerboot /tailscale/run.sh
+
+COPY --from=build-env /go/bin/* /usr/local/bin/
+COPY --from=builder /app/derper /opt/

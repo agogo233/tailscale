@@ -1,0 +1,118 @@
+name: Build Tailscale for OpenWrt x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: '覆盖版本号（可选）'
+        required: false
+        default: ''
+
+env:
+  GOOS: linux
+  GOARCH: amd64
+  CGO_ENABLED: 0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.3
+          cache: true
+
+      - name: Generate version
+        run: |
+          if [ -n "${{ inputs.version_override }}" ]; then
+            VERSION_SHORT="${{ inputs.version_override }}"
+            VERSION_LONG="${VERSION_SHORT}-$(git rev-parse --short HEAD)"
+            VERSION_GIT_HASH="$(git rev-parse HEAD)"
+          else
+            eval "$(go run ./cmd/mkversion)"
+          fi
+          echo "VERSION_SHORT=${VERSION_SHORT}"  >> $GITHUB_ENV
+          echo "VERSION_LONG=${VERSION_LONG}"    >> $GITHUB_ENV
+          echo "VERSION_GIT_HASH=${VERSION_GIT_HASH}" >> $GITHUB_ENV
+
+      - name: Cross-compile
+        run: |
+          LD_FLAGS="-X tailscale.com/version.longStamp=${VERSION_LONG} \
+                    -X tailscale.com/version.shortStamp=${VERSION_SHORT} \
+                    -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH} \
+                    -w -s"
+          mkdir -p build/data/usr/bin build/data/usr/sbin build/data/etc/init.d
+          go build -trimpath -ldflags="$LD_FLAGS" \
+            -o build/data/usr/bin/tailscale   ./cmd/tailscale
+          go build -trimpath -ldflags="$LD_FLAGS" \
+            -o build/data/usr/sbin/tailscaled ./cmd/tailscaled
+
+      - name: Create procd init script
+        run: |
+          cat > build/data/etc/init.d/tailscaled <<'INIT'
+          #!/bin/sh /etc/rc.common
+          START=95
+          STOP=01
+          USE_PROCD=1
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/sbin/tailscaled
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          stop_service() {
+              /usr/bin/tailscale down
+          }
+          INIT
+          chmod +x build/data/etc/init.d/tailscaled
+
+      - name: Package .tgz
+        run: |
+          PKG_NAME="tailscale_${VERSION_SHORT}_openwrt_x86_64"
+          mkdir -p "${PKG_NAME}/usr/bin" \
+                   "${PKG_NAME}/usr/sbin" \
+                   "${PKG_NAME}/etc/init.d"
+          cp build/data/usr/bin/tailscale      "${PKG_NAME}/usr/bin/"
+          cp build/data/usr/sbin/tailscaled    "${PKG_NAME}/usr/sbin/"
+          cp build/data/etc/init.d/tailscaled  "${PKG_NAME}/etc/init.d/"
+          tar czf "${PKG_NAME}.tgz" "${PKG_NAME}/"
+
+      - name: Package .ipk
+        run: |
+          PKG_VERSION="${VERSION_SHORT}"
+          PKG_NAME="tailscale_${PKG_VERSION}_x86_64"
+
+          mkdir -p build/ipk
+
+          cat > build/ipk/control <<EOF
+          Package: tailscale
+          Version: ${PKG_VERSION}
+          Depends: kmod-tun, ca-bundle, libc
+          Architecture: x86_64
+          Maintainer: Tailscale Inc <info@tailscale.com>
+          Description: WireGuard-based mesh VPN for OpenWrt
+          EOF
+
+          (cd build/data && tar czf ../ipk/data.tar.gz .)
+          (cd build/ipk && tar czf control.tar.gz control)
+          echo "2.0" > build/ipk/debian-binary
+
+          (cd build/ipk && ar -rc "../../${PKG_NAME}.ipk" \
+            debian-binary control.tar.gz data.tar.gz)
+
+      - name: Upload .tgz
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_openwrt_x86_64
+          path: tailscale_*_openwrt_x86_64.tgz
+
+      - name: Upload .ipk
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_x86_64
+          path: tailscale_*_x86_64.ipk

@@ -1,0 +1,66 @@
+name: Build Tailscale for Windows amd64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: '覆盖版本号（可选）'
+        required: false
+        default: ''
+
+env:
+  GOOS: windows
+  GOARCH: amd64
+  CGO_ENABLED: 0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.3
+          cache: true
+
+      - name: Generate version
+        run: |
+          if [ -n "${{ inputs.version_override }}" ]; then
+            VERSION_SHORT="${{ inputs.version_override }}"
+            VERSION_LONG="${VERSION_SHORT}-$(git rev-parse --short HEAD)"
+            VERSION_GIT_HASH="$(git rev-parse HEAD)"
+          else
+            eval "$(go run ./cmd/mkversion)"
+          fi
+          echo "VERSION_SHORT=${VERSION_SHORT}"  >> $GITHUB_ENV
+          echo "VERSION_LONG=${VERSION_LONG}"    >> $GITHUB_ENV
+          echo "VERSION_GIT_HASH=${VERSION_GIT_HASH}" >> $GITHUB_ENV
+
+      - name: Cross-compile
+        run: |
+          LD_FLAGS="-X tailscale.com/version.longStamp=${VERSION_LONG} \
+                    -X tailscale.com/version.shortStamp=${VERSION_SHORT} \
+                    -X tailscale.com/version.gitCommitStamp=${VERSION_GIT_HASH} \
+                    -w -s"
+          mkdir -p build
+          go build -trimpath -ldflags="$LD_FLAGS" \
+            -o build/tailscale.exe   ./cmd/tailscale
+          go build -trimpath -ldflags="$LD_FLAGS" \
+            -o build/tailscaled.exe ./cmd/tailscaled
+
+      - name: Package .zip
+        run: |
+          PKG_NAME="tailscale_${VERSION_SHORT}_windows_amd64"
+          mkdir -p "${PKG_NAME}"
+          cp build/tailscale.exe   "${PKG_NAME}/"
+          cp build/tailscaled.exe  "${PKG_NAME}/"
+          zip -r "${PKG_NAME}.zip" "${PKG_NAME}/"
+
+      - name: Upload .zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_windows_amd64
+          path: tailscale_*.zip
