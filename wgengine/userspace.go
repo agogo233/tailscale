@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
@@ -33,6 +34,7 @@ import (
 	"tailscale.com/net/ipset"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
@@ -50,7 +52,6 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
-	"tailscale.com/util/set"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
@@ -86,11 +87,12 @@ type userspaceEngine struct {
 	netMon         *netmon.Monitor
 	health         *health.Tracker
 	netMonOwned    bool                // whether we created netMon (and thus need to close it)
-	birdClient     BIRDClient          // or nil
 	controlKnobs   *controlknobs.Knobs // or nil
 
-	testMaybeReconfigHook func()                        // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
-	testDiscoChangedHook  func(map[key.NodePublic]bool) // for tests; if non-nil, fires after assembling discoChanged map
+	// bird is the BIRD integration handle constructed via
+	// [HookNewBird], or nil if [Config.BIRDSocket] was empty or the
+	// feature/bird package is not linked into the binary.
+	bird Bird
 
 	// isLocalAddr reports the whether an IP is assigned to the local
 	// tunnel interface. It's used to reflect local packets
@@ -114,11 +116,10 @@ type userspaceEngine struct {
 	// no longer install per-config lookup closures.
 	peerConfigFn atomic.Pointer[func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)]
 
-	lastCfgFull        wgcfg.Config
-	lastRouter         *router.Config
-	lastDNSConfig      dns.ConfigView // or invalid if none
-	lastIsSubnetRouter bool           // was the node a primary subnet router in the last run.
-	reconfigureVPN     func() error   // or nil
+	lastCfg        wgcfg.Config
+	lastRouter     *router.Config
+	lastDNSConfig  dns.ConfigView // or invalid if none
+	reconfigureVPN func() error   // or nil
 
 	// lastAppliedDisableTUNUDPGRO and lastAppliedDisableTUNTCPGRO cache the
 	// controlknobs values that were last applied to the TUN device. They are
@@ -161,18 +162,7 @@ type userspaceEngine struct {
 	// rewritten.
 	wgPeerLookup syncs.AtomicValue[func(wgString string) (tsString string, ok bool)]
 
-	// tsmpLearnedDisco tracks per node key if a peer disco key was learned via TSMP.
-	// wgLock must be held when using this map.
-	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
-
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
-}
-
-// BIRDClient handles communication with the BIRD Internet Routing Daemon.
-type BIRDClient interface {
-	EnableProtocol(proto string) error
-	DisableProtocol(proto string) error
-	Close() error
 }
 
 // Config is the engine configuration.
@@ -234,9 +224,10 @@ type Config struct {
 	// Used in "fake" mode for development.
 	RespondToPing bool
 
-	// BIRDClient, if non-nil, will be used to configure BIRD whenever
-	// this node is a primary subnet router.
-	BIRDClient BIRDClient
+	// BIRDSocket, if non-empty, is the path of the BIRD unix socket to
+	// configure whenever this node is a primary subnet router. It
+	// requires the feature/bird package to be linked in.
+	BIRDSocket string
 
 	// SetSubsystem, if non-nil, is called for each new subsystem created, just before a successful return.
 	SetSubsystem func(any)
@@ -375,17 +366,21 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		router:         rtr,
 		dialer:         conf.Dialer,
 		confListenPort: conf.ListenPort,
-		birdClient:     conf.BIRDClient,
 		controlKnobs:   conf.ControlKnobs,
 		reconfigureVPN: conf.ReconfigureVPN,
 		health:         conf.HealthTracker,
 	}
 
-	if e.birdClient != nil {
-		// Disable the protocol at start time.
-		if err := e.birdClient.DisableProtocol("tailscale"); err != nil {
+	if buildfeatures.HasBird && conf.BIRDSocket != "" {
+		newBird, ok := HookNewBird.GetOk()
+		if !ok {
+			return nil, errors.New("wgengine: Config.BIRDSocket set but the feature/bird package is not linked in")
+		}
+		bird, err := newBird(logf, conf.BIRDSocket)
+		if err != nil {
 			return nil, err
 		}
+		e.bird = bird
 	}
 	e.isLocalAddr.Store(ipset.FalseContainsIPFunc())
 	e.isDNSIPOverTailscale.Store(ipset.FalseContainsIPFunc())
@@ -681,59 +676,6 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 	return filter.Accept
 }
 
-// maybeReconfigWireguardLocked reconfigures wireguard-go with the current
-// full config, installing a PeerLookupFunc for on-demand peer creation.
-//
-// e.wgLock must be held.
-func (e *userspaceEngine) maybeReconfigWireguardLocked() error {
-	if hook := e.testMaybeReconfigHook; hook != nil {
-		hook()
-		return nil
-	}
-
-	full := e.lastCfgFull
-	// The wireguard-go peer set may have changed; drop the cached
-	// peer-string rewrites so the next log line re-resolves them
-	// against the current lookup.
-	e.wgLogger.Invalidate()
-
-	e.logf("wgengine: Reconfig: configuring userspace WireGuard config (with %d peers)", len(full.Peers))
-	if e.peerConfigFn.Load() != nil {
-		// The device has a long-lived PeerLookupFunc backed by the
-		// live config source, so only the peer set needs syncing;
-		// there is no per-config lookup closure to (re)install, and
-		// no removed peer can be resurrected with stale state.
-		//
-		// TODO(bradfitz): remove this O(n peers) sync. It's redundant
-		// with the incremental SyncDevicePeer calls that LocalBackend
-		// makes for exactly the peers whose allowed IPs changed. It
-		// only remains because peer changes still force a full
-		// Reconfig; once that's gated on actual router/DNS changes,
-		// this sync (and full-config peer syncing generally) can go.
-		peers := make(map[device.NoisePublicKey][]netip.Prefix, len(full.Peers))
-		for _, p := range full.Peers {
-			peers[p.PublicKey.Raw32()] = p.AllowedIPs
-		}
-		e.wgdev.RemoveMatchingPeers(func(pk device.NoisePublicKey) bool {
-			_, exists := peers[pk]
-			return !exists
-		})
-		// Update AllowedIPs on any already-active peers whose config
-		// may have changed. Peers that don't exist yet will get the
-		// correct AllowedIPs from the device's PeerLookupFunc when
-		// they are lazily created.
-		for pk, allowedIPs := range peers {
-			if peer, ok := e.wgdev.LookupActivePeer(pk); ok {
-				peer.SetAllowedIPs(allowedIPs)
-			}
-		}
-	} else if err := wgcfg.ReconfigDevice(e.wgdev, &full, e.logf); err != nil {
-		e.logf("wgdev.Reconfig: %v", err)
-		return err
-	}
-	return nil
-}
-
 // SetPeerConfigFunc implements [Engine.SetPeerConfigFunc]. It stores
 // fn and installs a single wgdev PeerLookupFunc wrapping it, so
 // lazily-created peers always get current allowed IPs and the lookup
@@ -756,6 +698,9 @@ func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
 	}
 	e.wgLock.Lock()
 	defer e.wgLock.Unlock()
+	// The peer set may be about to change; drop the wgLogger's cached
+	// peer-string rewrites so the next log line re-resolves them.
+	e.wgLogger.Invalidate()
 	allowedIPs, ok := (*fn)(k)
 	if !ok {
 		e.wgdev.RemovePeer(k.Raw32())
@@ -764,6 +709,14 @@ func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
 	if peer, ok := e.wgdev.LookupActivePeer(k.Raw32()); ok {
 		peer.SetAllowedIPs(allowedIPs)
 	}
+}
+
+// ResetDevicePeer implements [Engine.ResetDevicePeer].
+func (e *userspaceEngine) ResetDevicePeer(k key.NodePublic) {
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+	e.wgLogger.Invalidate()
+	e.wgdev.RemovePeer(k.Raw32())
 }
 
 // SetPeerByIPPacketFunc installs a callback used by wireguard-go to look up
@@ -826,17 +779,6 @@ func peerWireGuardStateFromDevice(state device.PeerSessionState) PeerWireGuardSt
 	}
 }
 
-// hasOverlap checks if there is a IPPrefix which is common amongst the two
-// provided slices.
-func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
-	for _, aip := range aips.All() {
-		if views.SliceContains(rips, aip) {
-			return true
-		}
-	}
-	return false
-}
-
 // ResetAndStop resets the engine to a clean state (like calling Reconfig
 // with all pointers to zero values) and returns the resulting status.
 //
@@ -849,12 +791,6 @@ func (e *userspaceEngine) ResetAndStop() (*Status, error) {
 		return nil, err
 	}
 	return e.getStatus()
-}
-
-func (e *userspaceEngine) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
-	e.wgLock.Lock()
-	defer e.wgLock.Unlock()
-	mak.Set(&e.tsmpLearnedDisco, pub, disco)
 }
 
 func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
@@ -871,11 +807,6 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	defer e.wgLock.Unlock()
 	e.tundev.SetWGConfig(cfg)
 
-	peerSet := make(set.Set[key.NodePublic], len(cfg.Peers))
-	for _, p := range cfg.Peers {
-		peerSet.Add(p.PublicKey)
-	}
-
 	e.mu.Lock()
 	self := e.selfNode
 	e.mu.Unlock()
@@ -887,16 +818,16 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 
 	peerMTUEnable := e.magicConn.ShouldPMTUD()
 
-	isSubnetRouter := false
-	if buildfeatures.HasBird && e.birdClient != nil && self.Valid() {
-		isSubnetRouter = hasOverlap(self.PrimaryRoutes(), self.Hostinfo().RoutableIPs())
-		e.logf("[v1] Reconfig: hasOverlap(%v, %v) = %v; isSubnetRouter=%v lastIsSubnetRouter=%v",
-			self.PrimaryRoutes(), self.Hostinfo().RoutableIPs(),
-			isSubnetRouter, isSubnetRouter, e.lastIsSubnetRouter)
+	// Let the BIRD integration recompute whether this node is a
+	// primary subnet router, before the early return below so that a
+	// change in that state alone still reaches the protocol toggle in
+	// ReconfigDone at the end.
+	birdChanged := false
+	if e.bird != nil {
+		birdChanged = e.bird.Reconfig(self)
 	}
-	isSubnetRouterChanged := buildfeatures.HasAdvertiseRoutes && isSubnetRouter != e.lastIsSubnetRouter
 
-	engineChanged := !e.lastCfgFull.Equal(cfg)
+	engineChanged := !e.lastCfg.Equal(cfg)
 	routerChanged := checkchange.Update(&e.lastRouter, routerCfg)
 	dnsChanged := buildfeatures.HasDNS && !e.lastDNSConfig.Equal(dnsCfg.View())
 	if dnsChanged {
@@ -915,7 +846,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		netlogChanged = e.netlogger.Reconfig(routerCfg, routerChanged)
 	}
 
-	if !engineChanged && !routerChanged && !dnsChanged && !listenPortChanged && !isSubnetRouterChanged && !peerMTUChanged && !netlogChanged {
+	if !engineChanged && !routerChanged && !dnsChanged && !listenPortChanged && !birdChanged && !peerMTUChanged && !netlogChanged {
 		return ErrNoChanges
 	}
 
@@ -928,64 +859,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		e.isDNSIPOverTailscale.Store(ipset.NewContainsIPFunc(views.SliceOf(dnsIPsOverTailscale(dnsCfg, routerCfg))))
 	}
 
-	// See if any peers have changed disco keys, which means they've restarted.
-	// If so, remove the peer from wireguard-go to flush its session key,
-	// then let the PeerLookupFunc re-create it on demand.
-	discoChanged := make(map[key.NodePublic]bool)
-	if engineChanged {
-		prevEP := make(map[key.NodePublic]key.DiscoPublic)
-		for i := range e.lastCfgFull.Peers {
-			if p := &e.lastCfgFull.Peers[i]; !p.DiscoKey.IsZero() {
-				prevEP[p.PublicKey] = p.DiscoKey
-			}
-		}
-		for i := range cfg.Peers {
-			p := &cfg.Peers[i]
-			if p.DiscoKey.IsZero() {
-				continue
-			}
-
-			pub := p.PublicKey
-
-			if old, ok := prevEP[pub]; ok && old != p.DiscoKey {
-				// If the disco key was learned via TSMP, we do not need to reset the
-				// wireguard config as the new key was received over an existing wireguard
-				// connection.
-				if discoTSMP, okTSMP := e.tsmpLearnedDisco[p.PublicKey]; okTSMP {
-					// Key matches, remove entry from map.
-					delete(e.tsmpLearnedDisco, p.PublicKey)
-					if discoTSMP == p.DiscoKey {
-						e.logf("wgengine: Skipping reconfig (TSMP key): %s changed from %q to %q",
-							pub.ShortString(), old, p.DiscoKey)
-						// Skip session clear.
-						continue
-					}
-
-					// The new disco key does not match what we received via
-					// TSMP for this peer. This is unexpected, though possible
-					// if processing a change in a large netmap ends up taking
-					// longer than the 2 second timeout in
-					// [controlClient.mapRoutineState.UpdateNetmapDelta], or if
-					// the context is cancelled mid update. Log the event, and reset
-					// the connection as it is possibly a stale entry in the map
-					// instead of a TSMP disco key update that led us here.
-					e.logf("wgengine: [unexpected] Reconfig: using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
-						pub.ShortString(), discoTSMP, p.DiscoKey, old)
-					metricTSMPLearnedKeyMismatch.Add(1)
-				}
-
-				discoChanged[pub] = true
-				e.logf("wgengine: Reconfig: %s changed from %q to %q", pub.ShortString(), old, p.DiscoKey)
-			}
-		}
-	}
-
-	// For tests, what disco connections needs to be changed.
-	if e.testDiscoChangedHook != nil {
-		e.testDiscoChangedHook(discoChanged)
-	}
-
-	if !e.lastCfgFull.PrivateKey.Equal(cfg.PrivateKey) {
+	if !e.lastCfg.PrivateKey.Equal(cfg.PrivateKey) {
 		// Tell magicsock about the new (or initial) private key
 		// (which is needed by DERP) before wgdev gets it, as wgdev
 		// will start trying to handshake, which we want to be able to
@@ -999,29 +873,16 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		}
 	}
 
-	e.lastCfgFull = *cfg.Clone()
+	e.lastCfg = *cfg.Clone()
 
 	e.magicConn.SetPreferredPort(listenPort)
 	e.magicConn.UpdatePMTUD()
 
-	if engineChanged {
-		if err := e.maybeReconfigWireguardLocked(); err != nil {
-			return err
-		}
-		// Now that we've reconfigured wireguard-go, remove any peers with
-		// changed disco keys to flush their session keys, and let them be
-		// re-created on demand by the PeerLookupFunc.
-		for pub := range discoChanged {
-			e.wgdev.RemovePeer(pub.Raw32())
-		}
-	}
-
-	// Cleanup map of tsmp marks for peers that no longer exists in config.
-	for nodeKey := range e.tsmpLearnedDisco {
-		if !peerSet.Contains(nodeKey) {
-			delete(e.tsmpLearnedDisco, nodeKey)
-		}
-	}
+	// Note: no wireguard-go device reconfig happens here. The device
+	// learns its peer set from the live config source installed via
+	// [Engine.SetPeerConfigFunc] (peers are lazily created and synced
+	// per peer by [Engine.SyncDevicePeer]), and its private key is set
+	// above when it changes.
 
 	if routerChanged {
 		e.logf("wgengine: Reconfig: configuring router")
@@ -1070,20 +931,10 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		e.netlogger.ReconfigDone()
 	}
 
-	if buildfeatures.HasBird && isSubnetRouterChanged && e.birdClient != nil {
-		e.logf("wgengine: Reconfig: configuring BIRD")
-		var err error
-		if isSubnetRouter {
-			err = e.birdClient.EnableProtocol("tailscale")
-		} else {
-			err = e.birdClient.DisableProtocol("tailscale")
-		}
-		if err != nil {
-			// Log but don't fail here.
-			e.logf("wgengine: error configuring BIRD: %v", err)
-		} else {
-			e.lastIsSubnetRouter = isSubnetRouter
-		}
+	// Let the BIRD integration apply any protocol state change now,
+	// after the router is configured.
+	if e.bird != nil {
+		e.bird.ReconfigDone()
 	}
 
 	e.logf("[v1] wgengine: Reconfig done")
@@ -1104,6 +955,10 @@ func (e *userspaceEngine) GetJailedFilter() *filter.Filter {
 
 func (e *userspaceEngine) SetJailedFilter(filt *filter.Filter) {
 	e.tundev.SetJailedFilter(filt)
+}
+
+func (e *userspaceEngine) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[*routemanager.PeerRoute]) {
+	e.tundev.SetPeerRoutes(native4, native6, routes)
 }
 
 func (e *userspaceEngine) SetStatusCallback(cb StatusCallback) {
@@ -1254,9 +1109,8 @@ func (e *userspaceEngine) Close() {
 	e.router.Close()
 	e.wgdev.Close()
 	e.tundev.Close()
-	if e.birdClient != nil {
-		e.birdClient.DisableProtocol("tailscale")
-		e.birdClient.Close()
+	if e.bird != nil {
+		e.bird.Close()
 	}
 	close(e.waitCh)
 
@@ -1692,8 +1546,6 @@ var (
 
 	metricTSMPDiscoKeyAdvertisementSent  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_sent")
 	metricTSMPDiscoKeyAdvertisementError = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_error")
-
-	metricTSMPLearnedKeyMismatch = clientmetric.NewCounter("magicsock_tsmp_learned_key_mismatch")
 )
 
 func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {

@@ -32,6 +32,7 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
@@ -166,6 +167,14 @@ type nodeBackend struct {
 	// nil in production, where no test installs a waiter.
 	keyWaitersForTest map[key.NodePublic]chan struct{}
 
+	// tsmpLearnedDisco records, per node key, a peer disco key that was
+	// learned via TSMP (that is, over an existing WireGuard session with
+	// that peer). When a netmap update later reports the same disco key
+	// change, the peer's WireGuard session does not need to be reset,
+	// because the change demonstrably arrived over a working session.
+	// See [nodeBackend.discoChangedLocked].
+	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
+
 	// routeMgr tracks this node's view of which IPs route to which
 	// peers and publishes lock-free snapshots for the data plane and
 	// the OS router. It is initialized once and immutable, but its
@@ -296,6 +305,12 @@ func (nb *nodeBackend) NodeByWireGuardString(s string) (_ tailcfg.NodeID, ok boo
 func (nb *nodeBackend) NodeByID(id tailcfg.NodeID) (_ tailcfg.NodeView, ok bool) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
+	return nb.nodeByIDLocked(id)
+}
+
+// nodeByIDLocked returns the node (peer or self) with the given node
+// ID. nb.mu must be held.
+func (nb *nodeBackend) nodeByIDLocked(id tailcfg.NodeID) (_ tailcfg.NodeView, ok bool) {
 	if nb.netMap != nil {
 		if self := nb.netMap.SelfNode; self.Valid() && self.ID() == id {
 			return self, true
@@ -579,7 +594,7 @@ func (nb *nodeBackend) netMapWithPeers() *netmap.NetworkMap {
 	return nm
 }
 
-func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
+func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) (discoChanged []key.NodePublic, routeChanged routemanager.PeersWithRouteChanges) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	nb.netMap = nm
@@ -587,7 +602,7 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
 	nb.updateNodeByKeyLocked()
 	nb.updateNodeByStableIDLocked()
 	nb.updateNodeByNameLocked()
-	nb.updatePeersLocked()
+	discoChanged, routeChanged = nb.updatePeersLocked()
 	nb.signalKeyWaitersForTestLocked()
 	if nm != nil {
 		nb.userProfiles = maps.Clone(nm.UserProfiles)
@@ -600,6 +615,7 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
 		nb.packetFilter = nil
 		nb.derpMapViewPub.Publish(tailcfg.DERPMapView{})
 	}
+	return discoChanged, routeChanged
 }
 
 // AwaitNodeKeyForTest returns a channel that is closed once a peer with the
@@ -780,9 +796,18 @@ func (nb *nodeBackend) ExtraDNSByName(hostname string) (_ netip.Addr, ok bool) {
 	return ip, ok
 }
 
-func (nb *nodeBackend) updatePeersLocked() {
+func (nb *nodeBackend) updatePeersLocked() (discoChanged []key.NodePublic, routeChanged routemanager.PeersWithRouteChanges) {
 	nm := nb.netMap
 	oldIDs := slices.Collect(maps.Keys(nb.peers))
+
+	// Snapshot the previous disco keys (by node key) before the peers
+	// map is repopulated, to detect restarted peers below.
+	var prevDisco map[key.NodePublic]key.DiscoPublic
+	for _, p := range nb.peers {
+		if !p.DiscoKey().IsZero() {
+			mak.Set(&prevDisco, p.Key(), p.DiscoKey())
+		}
+	}
 
 	if nm == nil {
 		nb.peers = nil
@@ -792,6 +817,18 @@ func (nb *nodeBackend) updatePeersLocked() {
 				nb.peers[p.ID()] = p
 			}
 		})
+	}
+
+	for _, p := range nb.peers {
+		if prev, ok := prevDisco[p.Key()]; ok && nb.discoChangedLocked(p.Key(), prev, p.DiscoKey()) {
+			discoChanged = append(discoChanged, p.Key())
+		}
+	}
+	// Drop TSMP-learned disco keys for peers no longer in the netmap.
+	for k := range nb.tsmpLearnedDisco {
+		if _, ok := nb.nodeByKey[k]; !ok {
+			delete(nb.tsmpLearnedDisco, k)
+		}
 	}
 
 	// Resync the route manager to the new peer set. Upserts of
@@ -806,7 +843,53 @@ func (nb *nodeBackend) updatePeersLocked() {
 	for _, p := range nb.peers {
 		rt.UpsertPeer(p)
 	}
-	rt.Commit()
+	res := rt.Commit()
+	return discoChanged, res.AllowedIPs
+}
+
+// recordTSMPLearnedDisco notes that a peer's new disco key was learned via
+// TSMP, so the netmap update carrying the same change need not reset the
+// peer's WireGuard session. See the [nodeBackend.tsmpLearnedDisco] field doc.
+func (nb *nodeBackend) recordTSMPLearnedDisco(pub key.NodePublic, disco key.DiscoPublic) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	mak.Set(&nb.tsmpLearnedDisco, pub, disco)
+}
+
+// discoChangedLocked reports whether a peer's disco key change from prev to
+// cur should reset the peer's WireGuard session. A changed disco key means
+// the peer restarted, so any existing session key material is dead weight;
+// resetting lets the handshake start over immediately. The exception is a
+// key change already learned via TSMP: that arrived over a working WireGuard
+// session with the peer, so the session is demonstrably fine and is kept.
+//
+// It consumes any [nodeBackend.tsmpLearnedDisco] entry for pub.
+// nb.mu must be held.
+func (nb *nodeBackend) discoChangedLocked(pub key.NodePublic, prev, cur key.DiscoPublic) bool {
+	if prev.IsZero() || cur.IsZero() || prev == cur {
+		return false
+	}
+	if discoTSMP, ok := nb.tsmpLearnedDisco[pub]; ok {
+		delete(nb.tsmpLearnedDisco, pub)
+		if discoTSMP == cur {
+			nb.logf("nodeBackend: skipping WireGuard session reset (TSMP key): %s changed from %q to %q",
+				pub.ShortString(), prev, cur)
+			return false
+		}
+		// The new disco key does not match what we received via
+		// TSMP for this peer. This is unexpected, though possible
+		// if processing a change in a large netmap ends up taking
+		// longer than the 2 second timeout in
+		// [controlclient.mapRoutineState.UpdateNetmapDelta], or if
+		// the context is cancelled mid update. Log the event, and reset
+		// the session as it is possibly a stale entry in the map
+		// instead of a TSMP disco key update that led us here.
+		nb.logf("nodeBackend: [unexpected] using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
+			pub.ShortString(), discoTSMP, cur, prev)
+		metricTSMPLearnedKeyMismatch.Add(1)
+	}
+	nb.logf("nodeBackend: peer %s disco key changed from %q to %q", pub.ShortString(), prev, cur)
+	return true
 }
 
 // routePrefs is the subset of routing-relevant prefs (and derived
@@ -835,10 +918,9 @@ type routePrefs struct {
 // updateRouteManagerPrefs pushes p into the route manager.
 //
 // It returns the peers whose allowed source prefixes changed as a
-// result (for example the old and new exit node when the selection
-// changes), as described by [routemanager.Result.AllowedIPs].
-// In particular, the value for a key will be nil when that peer was removed.
-func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) (changedAllowedIPs map[key.NodePublic][]netip.Prefix) {
+// result, for example the old and new exit node when the selection
+// changes.
+func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) routemanager.PeersWithRouteChanges {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	var exitID tailcfg.NodeID
@@ -859,6 +941,39 @@ func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) (changedAllowedIPs 
 	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT})
 	res := rt.Commit()
 	return res.AllowedIPs
+}
+
+// updateRouteManagerExtras pushes each peer's extra WireGuard-only
+// allowed IPs into the route manager, obtained by calling fn (the
+// [ipnext.Hooks.ExtraWireGuardAllowedIPs] hook) with each peer's
+// public key.
+//
+// It returns the peers whose allowed source prefixes changed as a
+// result.
+func (nb *nodeBackend) updateRouteManagerExtras(fn func(key.NodePublic) views.Slice[netip.Prefix]) routemanager.PeersWithRouteChanges {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	var extras map[tailcfg.NodeID][]netip.Prefix
+	for id, p := range nb.peers {
+		if pfxs := fn(p.Key()); pfxs.Len() > 0 {
+			mak.Set(&extras, id, pfxs.AsSlice())
+		}
+	}
+	rt := nb.routeMgr.Begin()
+	rt.SetExtraAllowedIPs(extras)
+	res := rt.Commit()
+	return res.AllowedIPs
+}
+
+// osRoutes returns the sorted set of prefixes that the route manager
+// wants programmed into the OS routing table.
+func (nb *nodeBackend) osRoutes() []netip.Prefix {
+	var routes []netip.Prefix
+	for pfx := range nb.routeMgr.OSRoutes().All() {
+		routes = append(routes, pfx)
+	}
+	tsaddr.SortPrefixes(routes)
+	return routes
 }
 
 // setPacketFilter stores the live packet filter rules and parsed
@@ -890,16 +1005,27 @@ func (nb *nodeBackend) mergeUserProfiles(profiles map[tailcfg.UserID]tailcfg.Use
 	}
 }
 
+// netmapDeltaResult describes the side effects of applying netmap
+// delta mutations that the caller must propagate.
+type netmapDeltaResult struct {
+	// ChangedAllowedIPs are the peers whose allowed source prefixes
+	// changed; the caller syncs those peers to the WireGuard device.
+	ChangedAllowedIPs routemanager.PeersWithRouteChanges
+
+	// DiscoChanged is the set of peers whose disco key changed in a
+	// way that requires a WireGuard session reset (see
+	// [nodeBackend.discoChangedLocked]).
+	DiscoChanged set.Set[key.NodePublic]
+}
+
 // UpdateNetmapDelta applies the given netmap mutations to the live
-// peer state. It returns the peers whose allowed source prefixes
-// changed (as described by [routemanager.Result.AllowedIPs]) so the
-// caller can sync those peers to the WireGuard device, and reports
-// whether it handled all of the mutations.
-func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (changedAllowedIPs map[key.NodePublic][]netip.Prefix, handled bool) {
+// peer state. It returns the side effects for the caller to
+// propagate, and reports whether it handled all of the mutations.
+func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (res netmapDeltaResult, handled bool) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	if nb.netMap == nil {
-		return nil, false
+		return res, false
 	}
 
 	// Locally cloned mutable nodes, to avoid calling AsStruct (clone)
@@ -914,14 +1040,23 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (changedAll
 	// get a full netmap soon and reset all our state anyway.
 	rt := nb.routeMgr.Begin()
 	defer func() {
-		res := rt.Commit()
-		changedAllowedIPs = res.AllowedIPs
+		res.ChangedAllowedIPs = rt.Commit().AllowedIPs
 	}()
 
 	for _, m := range muts {
 		switch m := m.(type) {
 		case netmap.NodeMutationUpsert:
 			nid := m.Node.ID()
+			if old, ok := nb.peers[nid]; ok {
+				if old.Key() == m.Node.Key() {
+					if nb.discoChangedLocked(m.Node.Key(), old.DiscoKey(), m.Node.DiscoKey()) {
+						res.DiscoChanged.Make()
+						res.DiscoChanged.Add(m.Node.Key())
+					}
+				} else {
+					delete(nb.tsmpLearnedDisco, old.Key())
+				}
+			}
 			mak.Set(&nb.peers, nid, m.Node)
 			for _, ipp := range m.Node.Addresses().All() {
 				if ipp.IsSingleIP() {
@@ -945,6 +1080,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (changedAll
 				delete(nb.nodeByKey, old.Key())
 				delete(nb.nodeByWGString, old.Key().WireGuardGoString())
 				delete(nb.nodeByStableID, old.StableID())
+				delete(nb.tsmpLearnedDisco, old.Key())
 				nb.removeNodeNameLocked(old.Name())
 				delete(nb.peers, nid)
 				rt.RemovePeer(nid)
@@ -958,7 +1094,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (changedAll
 			nv, ok := nb.peers[nid]
 			if !ok {
 				// TODO(bradfitz): unexpected metric?
-				return nil, false
+				return res, false
 			}
 			n = nv.AsStruct()
 			mak.Set(&mutableNodes, nv.ID(), n)
@@ -969,7 +1105,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (changedAll
 		nb.peers[nid] = n.View()
 	}
 	nb.signalKeyWaitersForTestLocked()
-	return nil, true
+	return res, true
 }
 
 // unlockedNodesPermitted reports whether any peer with theUnsignedPeerAPIOnly bool set true has any of its allowed IPs
@@ -992,10 +1128,137 @@ func (nb *nodeBackend) setFilter(f *filter.Filter) {
 	nb.filterAtomic.Store(f)
 }
 
-func (nb *nodeBackend) dnsConfigForNetmap(prefs ipn.PrefsView, selfExpired bool, versionOS string) *dns.Config {
+func (nb *nodeBackend) dnsConfigForNetmap(prefs ipn.PrefsView, selfExpired bool, goos string) *dns.Config {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	return dnsConfigForNetmap(nb.netMap, nb.peers, prefs, selfExpired, nb.logf, versionOS)
+	return dnsConfigForNetmap(nb.netMap, nb.peers, prefs, selfExpired, nb.logf, goos)
+}
+
+// magicDNSHostAddrs returns the MagicDNS A/AAAA answer for fqdn from
+// the live node indexes, and whether the name is known. It backs
+// [resolver.MagicDNSHosts.LookupHost], replacing the full
+// dns.Config.Hosts map so that netmap deltas need no per-peer DNS
+// rebuild.
+func (nb *nodeBackend) magicDNSHostAddrs(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool) {
+	if !buildfeatures.HasDNS {
+		return nil, false
+	}
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	n, ok := nb.nodeByFQDNLocked(fqdn)
+	if !ok || n.Addresses().Len() == 0 {
+		return nil, false
+	}
+	nm := nb.netMap
+	var flags magicDNSAddrsFlags
+	if nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs6) &&
+		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4) {
+		flags |= selfV6Only
+	}
+	if nm.AllCaps.Contains(tailcfg.NodeAttrMagicDNSPeerAAAA) {
+		flags |= wantAAAA
+	}
+	return magicDNSAddrs(n.Addresses(), flags), true
+}
+
+// magicDNSPTR returns the MagicDNS name of the node (peer or self)
+// that owns ip, backing [resolver.MagicDNSHosts.LookupPTR].
+func (nb *nodeBackend) magicDNSPTR(ip netip.Addr) (_ dnsname.FQDN, ok bool) {
+	if !buildfeatures.HasDNS {
+		return "", false
+	}
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	nid, ok := nb.nodeByAddr[ip]
+	if !ok {
+		return "", false
+	}
+	n, ok := nb.nodeByIDLocked(nid)
+	if !ok {
+		return "", false
+	}
+	fqdn, err := dnsname.ToFQDN(n.Name())
+	if err != nil {
+		return "", false
+	}
+	return fqdn, true
+}
+
+// magicDNSSubdomainHost reports whether fqdn names a node with the
+// [tailcfg.NodeAttrDNSSubdomainResolve] attribute, backing
+// [resolver.MagicDNSHosts.SubdomainHost].
+func (nb *nodeBackend) magicDNSSubdomainHost(fqdn dnsname.FQDN) bool {
+	if !buildfeatures.HasDNS {
+		return false
+	}
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	n, ok := nb.nodeByFQDNLocked(fqdn)
+	if !ok {
+		return false
+	}
+	if nm := nb.netMap; nm != nil && nm.SelfNode.Valid() && nm.SelfNode.ID() == n.ID() {
+		return nm.AllCaps.Contains(tailcfg.NodeAttrDNSSubdomainResolve)
+	}
+	return n.CapMap().Contains(tailcfg.NodeAttrDNSSubdomainResolve)
+}
+
+// nodeByFQDNLocked returns the node (peer or self) with the given
+// MagicDNS FQDN. nb.mu must be held.
+func (nb *nodeBackend) nodeByFQDNLocked(fqdn dnsname.FQDN) (_ tailcfg.NodeView, ok bool) {
+	// The resolver already lowercases query names, but lowercase
+	// again (nearly free when already lowercase) so that no other
+	// caller of the [resolver.MagicDNSHosts] hook can miss on case.
+	nid, ok := nb.nodeByName[strings.ToLower(strings.TrimSuffix(string(fqdn), "."))]
+	if !ok {
+		return tailcfg.NodeView{}, false
+	}
+	return nb.nodeByIDLocked(nid)
+}
+
+// magicDNSAddrsFlags is a bitmask of flags for magicDNSAddrs.
+type magicDNSAddrsFlags uint8
+
+const (
+	selfV6Only magicDNSAddrsFlags = 1 << iota // the querying node has only IPv6 addresses
+	wantAAAA                                  // include IPv6 addresses even for nodes that also have IPv4
+)
+
+// magicDNSAddrs returns the MagicDNS answer addresses for a node
+// owning the given addresses: all of its IPv6 addresses if this node
+// (the querier) is IPv6-only, otherwise everything except the node's
+// IPv6 addresses when it also has IPv4, unless wantAAAA. The result
+// may be empty (name exists, no records of the desired family).
+func magicDNSAddrs(addrs views.Slice[netip.Prefix], flags magicDNSAddrsFlags) (ips []netip.Addr) {
+	wantAAAA := flags&wantAAAA != 0
+	selfV6Only := flags&selfV6Only != 0
+	var have4 bool
+	for _, addr := range addrs.All() {
+		if addr.Addr().Is4() {
+			have4 = true
+			break
+		}
+	}
+	for _, addr := range addrs.All() {
+		if selfV6Only {
+			if addr.Addr().Is6() {
+				ips = append(ips, addr.Addr())
+			}
+			continue
+		}
+		// If this node has an IPv4 address, then remove peers'
+		// IPv6 addresses for now, as we don't guarantee that
+		// the peer node actually can speak IPv6 correctly.
+		//
+		// https://github.com/tailscale/tailscale/issues/1152
+		// tracks adding the right capability reporting to
+		// enable AAAA in MagicDNS.
+		if addr.Addr().Is6() && have4 && !wantAAAA {
+			continue
+		}
+		ips = append(ips, addr.Addr())
+	}
+	return ips
 }
 
 func (nb *nodeBackend) exitNodeCanProxyDNS(exitNodeID tailcfg.StableNodeID) (dohURL string, ok bool) {
@@ -1100,9 +1363,9 @@ func useWithExitNodeRoutes(routes map[string][]*dnstype.Resolver) map[string][]*
 // dnsConfigForNetmap returns a *dns.Config for the given netmap,
 // prefs, client OS version, and cloud hosting environment.
 //
-// The versionOS is a Tailscale-style version ("iOS", "macOS") and not
-// a runtime.GOOS.
-func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
+// The goos is runtime.GOOS usually, except in tests, where it may
+// vary to test any OS's behavior from any host.
+func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, goos string) *dns.Config {
 	if nm == nil {
 		return nil
 	}
@@ -1128,70 +1391,40 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		Hosts:     map[dnsname.FQDN][]netip.Addr{},
 	}
 
-	// selfV6Only is whether we only have IPv6 addresses ourselves.
-	selfV6Only := nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs6) &&
-		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4)
-	dcfg.OnlyIPv6 = selfV6Only
-
-	wantAAAA := nm.AllCaps.Contains(tailcfg.NodeAttrMagicDNSPeerAAAA)
-
-	// Populate MagicDNS records. We do this unconditionally so that
-	// quad-100 can always respond to MagicDNS queries, even if the OS
-	// isn't configured to make MagicDNS resolution truly
-	// magic. Details in
-	// https://github.com/tailscale/tailscale/issues/1886.
-	set := func(name string, addrs views.Slice[netip.Prefix]) {
-		if addrs.Len() == 0 || name == "" {
-			return
-		}
-		fqdn, err := dnsname.ToFQDN(name)
-		if err != nil {
-			return // TODO: propagate error?
-		}
-		var have4 bool
-		for _, addr := range addrs.All() {
-			if addr.Addr().Is4() {
-				have4 = true
-				break
-			}
-		}
-		var ips []netip.Addr
-		for _, addr := range addrs.All() {
-			if selfV6Only {
-				if addr.Addr().Is6() {
-					ips = append(ips, addr.Addr())
-				}
-				continue
-			}
-			// If this node has an IPv4 address, then
-			// remove peers' IPv6 addresses for now, as we
-			// don't guarantee that the peer node actually
-			// can speak IPv6 correctly.
-			//
-			// https://github.com/tailscale/tailscale/issues/1152
-			// tracks adding the right capability reporting to
-			// enable AAAA in MagicDNS.
-			if addr.Addr().Is6() && have4 && !wantAAAA {
-				continue
-			}
-			ips = append(ips, addr.Addr())
-		}
-		dcfg.Hosts[fqdn] = ips
+	var addrFlags magicDNSAddrsFlags
+	if nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs6) &&
+		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4) {
+		// We only have IPv6 addresses ourselves.
+		addrFlags |= selfV6Only
+		dcfg.OnlyIPv6 = true
 	}
-	set(nm.SelfName(), nm.GetAddresses())
-	if nm.AllCaps.Contains(tailcfg.NodeAttrDNSSubdomainResolve) {
-		if fqdn, err := dnsname.ToFQDN(nm.SelfName()); err == nil {
-			dcfg.SubdomainHosts.Make()
-			dcfg.SubdomainHosts.Add(fqdn)
-		}
+	if nm.AllCaps.Contains(tailcfg.NodeAttrMagicDNSPeerAAAA) {
+		addrFlags |= wantAAAA
 	}
-	for _, peer := range peers {
-		set(peer.Name(), peer.Addresses())
-		if peer.CapMap().Contains(tailcfg.NodeAttrDNSSubdomainResolve) {
-			if fqdn, err := dnsname.ToFQDN(peer.Name()); err == nil {
-				dcfg.SubdomainHosts.Make()
-				dcfg.SubdomainHosts.Add(fqdn)
+
+	// Populate MagicDNS records. The internal quad-100 resolver pulls
+	// per-node records on demand from the live node indexes (see
+	// [nodeBackend.magicDNSHostAddrs]), so quad-100 can always respond
+	// to MagicDNS queries without dcfg.Hosts; details in
+	// https://github.com/tailscale/tailscale/issues/1886. dcfg.Hosts
+	// carries only what must be enumerable in full: control's
+	// DNS.ExtraRecords below, plus every node's records on Windows,
+	// whose hosts-file fallback path (see compileHostEntries in
+	// net/dns) needs the complete set.
+	if goos == "windows" {
+		set := func(name string, addrs views.Slice[netip.Prefix]) {
+			if addrs.Len() == 0 || name == "" {
+				return
 			}
+			fqdn, err := dnsname.ToFQDN(name)
+			if err != nil {
+				return // TODO: propagate error?
+			}
+			dcfg.Hosts[fqdn] = magicDNSAddrs(addrs, addrFlags)
+		}
+		set(nm.SelfName(), nm.GetAddresses())
+		for _, peer := range peers {
+			set(peer.Name(), peer.Addresses())
 		}
 	}
 	for _, rec := range nm.DNS.ExtraRecords {
@@ -1229,6 +1462,14 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		for _, dom := range magicDNSRootDomains(nm) {
 			dcfg.Routes[dom] = nil // resolve internally with dcfg.Hosts
 		}
+	} else {
+		// Without MagicDNS domain routing, no Routes entry covers the
+		// node records served on demand via [magicDNSHosts]. Tell
+		// dns.Manager they exist, so it keeps quad-100 in the OS
+		// resolver path and the names still resolve, as they did when
+		// they were listed in dcfg.Hosts. Any netmap with a self node
+		// has such records.
+		dcfg.MagicDNSHostsUnrouted = nm.SelfNode.Valid()
 	}
 
 	addDefault := func(resolvers []*dnstype.Resolver) {
