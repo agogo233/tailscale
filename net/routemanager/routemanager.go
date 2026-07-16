@@ -324,16 +324,21 @@ type Result struct {
 	Outbound *bart.Table[*PeerRoute]
 	OSRoutes *bart.Lite
 
-	// AllowedIPs maps the public key of each peer whose allowed
-	// source prefixes changed in this commit to its new sorted
-	// prefix list, as [RouteManager.PeerAllowedIPs] would now
-	// return it. A nil value means the peer no longer has any
-	// allowed prefixes, because it was removed or now contributes
-	// nothing. When a peer's key changes, the old key maps to nil
-	// and the new key to the peer's prefixes. The map is nil when
-	// no peer's allowed prefixes changed.
-	AllowedIPs map[key.NodePublic][]netip.Prefix
+	// AllowedIPs describes the peers whose allowed source prefixes
+	// changed in this commit. The map is nil when no peer's allowed
+	// prefixes changed.
+	AllowedIPs PeersWithRouteChanges
 }
+
+// PeersWithRouteChanges maps the public key of each peer whose
+// allowed source prefixes changed to its new sorted prefix list, as
+// [RouteManager.PeerAllowedIPs] would now return it.
+//
+// A nil value means the peer no longer has any allowed prefixes,
+// because it was removed or now contributes nothing; consumers
+// should treat such peers as deleted. When a peer's key changes, the
+// old key maps to nil and the new key to the peer's prefixes.
+type PeersWithRouteChanges map[key.NodePublic][]netip.Prefix
 
 type opKind uint8
 
@@ -392,12 +397,11 @@ func (m *Mutation) UpsertPeer(n tailcfg.NodeView) {
 // peerViewOf reduces a tailcfg.NodeView to the routing-relevant
 // peerView.
 //
-// It mirrors the peer and prefix filtering in nmcfg.WGCfg: peers we
-// cannot communicate with (expired, or predating both DERP and disco)
-// contribute no prefixes. They remain tracked by ID and key so that a
-// later update can make them routable again. AllowedIPs is the sole
-// source of prefixes; an address absent from AllowedIPs is not
-// routable. The self-vs-route split mirrors nmcfg's cidrIsSubnet:
+// Peers we cannot communicate with (expired, or predating both DERP
+// and disco) contribute no prefixes. They remain tracked by ID and key
+// so that a later update can make them routable again. AllowedIPs is
+// the sole source of prefixes; an address absent from AllowedIPs is
+// not routable. For the self-vs-route split,
 // single Tailscale IPs are never subnets, so a VIP service address
 // hosted by the peer lands in SelfAddrs and stays routable without
 // Prefs.RouteAll.
@@ -657,8 +661,7 @@ func normalizePrefix(p netip.Prefix) netip.Prefix {
 // non-address bits set, mirroring the defensive check in
 // ipnlocal.peerRoutes. It includes the peer's extra allowed IPs,
 // except for peers that contribute no addresses or routes of their
-// own (expired or otherwise non-communicable peers, which mirrors
-// nmcfg.WGCfg dropping such peers entirely).
+// own (expired or otherwise non-communicable peers).
 func (rm *RouteManager) contribs(p peerView) map[netip.Prefix]contribKind {
 	c := make(map[netip.Prefix]contribKind, len(p.SelfAddrs)+len(p.Routes))
 	add := func(pfx netip.Prefix, kind contribKind) {

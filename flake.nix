@@ -164,9 +164,13 @@
           # Makefile target that boots the Tailscale appliance under qemu.
           mtools
           dtc
+
+          # awscli2 is used by gokrazy/build.go to import and register the
+          # Tailscale appliance AMI.
+          awscli2.out
         ];
       };
     });
   };
 }
-# nix-direnv cache busting line: sha256-y6rBPJtkhTQMsnUoUC/1Up61FEplPpxaU1OkO2FDeio=
+# nix-direnv cache busting line: sha256-y7ZgrxWeeUYG+FKL9Ym8QmqaQsGnUVc9GXkA4na/AJI=
