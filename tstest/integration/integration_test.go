@@ -35,6 +35,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	_ "tailscale.com/feature/clientupdate"
 	"tailscale.com/health"
@@ -44,6 +45,7 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
@@ -57,6 +59,11 @@ func TestMain(m *testing.M) {
 	// Have to disable UPnP which hits the network, otherwise it fails due to HTTP proxy.
 	os.Setenv("TS_DISABLE_UPNP", "true")
 	flag.Parse()
+	if *runWindowsServiceTests && runtime.GOOS == "windows" {
+		// On Windows the service is a singleton, so its tests run serially.
+		// envknob.Setenv refreshes the TS_SERIAL_TESTS that tstest.Parallel reads.
+		envknob.Setenv("TS_SERIAL_TESTS", "true")
+	}
 	v := m.Run()
 	if v != 0 {
 		os.Exit(v)
@@ -82,8 +89,7 @@ func TestTUNMode(t *testing.T) {
 	tstest.RequireRoot(t)
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
-	env.tunMode = true
-	n1 := NewTestNode(t, env)
+	n1 := NewTestNode(t, env, TUNMode(true))
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -200,6 +206,9 @@ func TestExpectedFeaturesLinked(t *testing.T) {
 }
 
 func TestCollectPanic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("has a Windows panic-capture race; see #20443")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n := NewTestNode(t, env)
@@ -839,6 +848,9 @@ func TestOneNodeUpInterruptedDeviceApproval(t *testing.T) {
 }
 
 func TestConfigFileAuthKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("--config is unsupported by the Windows service; see #20871")
+	}
 	t.Parallel()
 	const authKey = "opensesame"
 	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
@@ -902,10 +914,11 @@ func TestTwoNodes(t *testing.T) {
 		os.WriteFile("n2.log", cleanLog(n2), 0666)
 	})
 
-	n1Socks := n1.AwaitSocksAddr(n1SocksAddrCh)
-	n2Socks := n1.AwaitSocksAddr(n2SocksAddrCh)
-	t.Logf("node1 SOCKS5 addr: %v", n1Socks)
-	t.Logf("node2 SOCKS5 addr: %v", n2Socks)
+	if runtime.GOOS != "windows" {
+		// TODO(yaruk): the service node has no stderr to scrape the address from; see #20443.
+		t.Logf("node1 SOCKS5 addr: %v", n1.AwaitSocksAddr(n1SocksAddrCh))
+		t.Logf("node2 SOCKS5 addr: %v", n1.AwaitSocksAddr(n2SocksAddrCh))
+	}
 
 	n1.AwaitListening()
 	t.Logf("n1 is listening")
@@ -1261,6 +1274,9 @@ func TestC2NPingRequest(t *testing.T) {
 // Issue 2434: when "down" (WantRunning false), tailscaled shouldn't
 // be connected to control.
 func TestNoControlConnWhenDown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("restarting the daemon with preserved state needs harness support; see #20750")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n1 := NewTestNode(t, env)
@@ -1332,7 +1348,8 @@ func TestClientSideJailing(t *testing.T) {
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	registerNode := func() (*TestNode, key.NodePublic) {
-		n := NewTestNode(t, env)
+		// The dial being tested only reaches the listener in userspace networking mode.
+		n := NewTestNode(t, env, TUNMode(false))
 		n.StartDaemon()
 		n.AwaitListening()
 		n.MustUp()
@@ -1627,6 +1644,9 @@ func TestAutoUpdateDefaults_cap(t *testing.T) { testAutoUpdateDefaults(t, true) 
 // useCap is whether to use NodeAttrDefaultAutoUpdate (as opposed to the old
 // DeprecatedDefaultAutoUpdate top-level MapResponse field).
 func testAutoUpdateDefaults(t *testing.T, useCap bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	t.Cleanup(feature.HookCanAutoUpdate.SetForTest(func() bool { return true }))
 
 	env := NewTestEnv(t)
@@ -1663,7 +1683,7 @@ func testAutoUpdateDefaults(t *testing.T, useCap bool) {
 				if mr.Node.CapMap == nil {
 					mr.Node.CapMap = make(tailcfg.NodeCapMap)
 				}
-				mr.Node.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] = []tailcfg.RawMessage{
+				mr.Node.CapMap[nodecap.DefaultAutoUpdate] = []tailcfg.RawMessage{
 					tailcfg.RawMessage(fmt.Sprintf("%t", send)),
 				}
 			} else {
@@ -1763,8 +1783,7 @@ func testAutoUpdateDefaults(t *testing.T, useCap bool) {
 func TestDNSOverTCPIntervalResolver(t *testing.T) {
 	tstest.RequireRoot(t)
 	env := NewTestEnv(t)
-	env.tunMode = true
-	n1 := NewTestNode(t, env)
+	n1 := NewTestNode(t, env, TUNMode(true))
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -1833,11 +1852,10 @@ func TestNetstackTCPLoopback(t *testing.T) {
 	tstest.RequireRoot(t)
 
 	env := NewTestEnv(t)
-	env.tunMode = true
 	loopbackPort := 5201
 	env.loopbackPort = &loopbackPort
 	loopbackPortStr := strconv.Itoa(loopbackPort)
-	n1 := NewTestNode(t, env)
+	n1 := NewTestNode(t, env, TUNMode(true))
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -1972,10 +1990,9 @@ func TestNetstackUDPLoopback(t *testing.T) {
 	tstest.RequireRoot(t)
 
 	env := NewTestEnv(t)
-	env.tunMode = true
 	loopbackPort := 5201
 	env.loopbackPort = &loopbackPort
-	n1 := NewTestNode(t, env)
+	n1 := NewTestNode(t, env, TUNMode(true))
 	d1 := n1.StartDaemon()
 
 	n1.AwaitResponding()
@@ -2111,6 +2128,9 @@ func TestNetstackUDPLoopback(t *testing.T) {
 }
 
 func TestEncryptStateMigration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("--encrypt-state is unsupported by the Windows service; see #20872")
+	}
 	if !hostinfo.New().TPM.Present() {
 		t.Skip("TPM not available")
 	}
@@ -2449,11 +2469,10 @@ func TestC2NDebugNetmap(t *testing.T) {
 }
 
 func TestTailnetLock(t *testing.T) {
-
 	// If you run `tailscale lock log` on a node where Tailnet Lock isn't
 	// enabled, you get an error explaining that.
 	t.Run("log-when-not-enabled", func(t *testing.T) {
-		t.Parallel()
+		tstest.Parallel(t)
 
 		env := NewTestEnv(t)
 		n1 := NewTestNode(t, env)
@@ -2490,11 +2509,11 @@ func TestTailnetLock(t *testing.T) {
 	// the signed nodes can talk to each other but the unsigned node cannot
 	// talk to anybody.
 	t.Run("node-connectivity", func(t *testing.T) {
-		t.Parallel()
+		tstest.Parallel(t)
 
 		env := NewTestEnv(t)
 		env.Control.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
-			tailcfg.CapabilityTailnetLock: []tailcfg.RawMessage{},
+			nodecap.TailnetLock: []tailcfg.RawMessage{},
 		}
 
 		// Start two nodes which will be our signing nodes.
@@ -2565,7 +2584,7 @@ func TestTailnetLock(t *testing.T) {
 	t.Run("no-keys-is-error", func(t *testing.T) {
 		for _, verb := range []string{"add", "remove", "revoke-keys"} {
 			t.Run(verb, func(t *testing.T) {
-				t.Parallel()
+				tstest.Parallel(t)
 
 				env := NewTestEnv(t)
 				n1 := NewTestNode(t, env)
@@ -2593,7 +2612,8 @@ func TestTailnetLock(t *testing.T) {
 func TestNodeWithBadStateFile(t *testing.T) {
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
-	n1 := NewTestNode(t, env)
+	// A userspace node keeps its state in the test's temp dir, where the corrupt file can be seeded.
+	n1 := NewTestNode(t, env, TUNMode(false))
 	if err := os.WriteFile(n1.stateFile, []byte("bad json"), 0644); err != nil {
 		t.Fatal(err)
 	}

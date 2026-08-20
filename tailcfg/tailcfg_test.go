@@ -17,6 +17,7 @@ import (
 
 	"tailscale.com/ipn/ipnstate"
 	. "tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
@@ -1081,23 +1082,23 @@ func TestMarshalToRawMessageAndBack(t *testing.T) {
 	}
 	tests := []struct {
 		name    string
-		capType PeerCapability
+		capType peercap.Cap
 		val     testRule
 	}{
 		{
 			name:    "empty",
 			val:     testRule{},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
 			name:    "some-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
 			name:    "all-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 	}
 	for _, tc := range tests {
@@ -1308,5 +1309,32 @@ func TestServiceActionTypeValid(t *testing.T) {
 		if got := tt.typ.Valid(); got != tt.want {
 			t.Errorf("ServiceActionType(%q).Valid() = %v, want %v", tt.typ, got, tt.want)
 		}
+	}
+}
+
+// TestSSHActionJSON verifies that SSHAction round-trips through
+// encoding/json with SessionDuration encoded as int64 nanoseconds.
+// It notably guards against jsonv2 `format` tag options in struct
+// tags, which Go 1.27's encoding/json rejects at runtime.
+// See https://github.com/tailscale/tailscale/issues/20528.
+func TestSSHActionJSON(t *testing.T) {
+	a := SSHAction{
+		Accept:          true,
+		SessionDuration: 5 * time.Second,
+	}
+	got, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	const want = `{"accept":true,"sessionDuration":5000000000}`
+	if string(got) != want {
+		t.Errorf("Marshal = %s; want %s", got, want)
+	}
+	var back SSHAction
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(back, a) {
+		t.Errorf("round trip = %+v; want %+v", back, a)
 	}
 }

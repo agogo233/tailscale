@@ -1,9 +1,9 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package monitor provides facilities for monitoring network
-// interface and route changes. It primarily exists to know when
-// portable devices move between different networks.
+// Package netmon provides facilities for monitoring network interface and
+// route changes. It primarily exists to know when portable devices move
+// between different networks.
 package netmon
 
 import (
@@ -254,7 +254,7 @@ func (cd *ChangeDelta) InterfaceIPDisappeared(ip netip.Addr) bool {
 	if cd.new == nil && cd.old.HasIP(ip) {
 		return true
 	}
-	return cd.new.HasIP(ip) && !cd.old.HasIP(ip)
+	return cd.old.HasIP(ip) && !cd.new.HasIP(ip)
 }
 
 // AnyInterfaceUp reports whether any interfaces are up in the new state.

@@ -13,6 +13,30 @@ import (
 	"tailscale.com/tstest/deptest"
 )
 
+func TestOmitServiceClientPrefs(t *testing.T) {
+	const msg = "unexpected with ts_omit_serviceclientprefs"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_serviceclientprefs,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/serviceclientprefs": msg,
+		},
+	}.Check(t)
+}
+
+func TestOmitFavorites(t *testing.T) {
+	const msg = "unexpected with ts_omit_favorites"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_favorites,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/favorites": msg,
+		},
+	}.Check(t)
+}
+
 func TestOmitSSH(t *testing.T) {
 	const msg = "unexpected with ts_omit_ssh"
 	deptest.DepChecker{
@@ -29,6 +53,21 @@ func TestOmitSSH(t *testing.T) {
 			"github.com/pkg/sftp":                  msg,
 			"github.com/u-root/u-root/pkg/termios": msg,
 			"tempfork/gliderlabs/ssh":              msg,
+		},
+	}.Check(t)
+}
+
+func TestOmitSyslog(t *testing.T) {
+	const msg = "unexpected syslog usage with ts_omit_syslog"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		// Tailscale SSH's incubator also uses log/syslog, so omit
+		// SSH too to lock down the standard library package.
+		Tags: "ts_omit_syslog,ts_omit_ssh,ts_include_cli",
+		BadDeps: map[string]string{
+			"log/syslog":                   msg,
+			"tailscale.com/feature/syslog": msg,
 		},
 	}.Check(t)
 }

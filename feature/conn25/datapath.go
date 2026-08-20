@@ -204,7 +204,7 @@ func (dh *datapathHandler) HandlePacketFromWireGuard(p *packet.Parsed, tun *tstu
 // that the packet should pass through subsequent stages of the datapath pipeline.
 // Returning [filter.Drop] signals the packet should be dropped. This method handles all
 // packets coming from the tun device, on both connectors, and clients of connectors.
-func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Response {
+func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstun.Wrapper) filter.Response {
 	if !isSupportedProtocol(p.IPProto) {
 		return filter.Accept
 	}
@@ -233,7 +233,9 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Re
 	transitIP, err := dh.conn25.ClientTransitIPForMagicIP(magicIP)
 	if err != nil {
 		if errors.Is(err, ErrUnmappedMagicIP) {
-			// TODO(tailscale/corp#34257): This path should deliver an ICMP error to the client.
+			// Couldn't find a mapping. Tell the local application the host is
+			// unreachable so it can recover quickly instead of blackholing.
+			dh.sendICMPHostUnreachable(p, tun)
 			return filter.Drop
 		}
 		dh.debugLogf("error mapping magic IP, passing packet unmodified: %v", err)
@@ -273,6 +275,22 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Re
 	return filter.Accept
 }
 
+// sendICMPHostUnreachable injects an ICMP "host unreachable" error (or its IPv6
+// equivalent, "address unreachable") back to the local host in response to the
+// tun-device packet p. The error is delivered inbound so the local
+// application that sent p sees it, giving it the chance to recover.
+func (dh *datapathHandler) sendICMPHostUnreachable(p *packet.Parsed, tun *tstun.Wrapper) {
+	// The error appears to come from the unreachable Magic IP, addressed back to
+	// the sender, and embeds data from the invoking packet.
+	errPkt := packet.GenerateICMPHostUnreachable(p.Dst.Addr(), p.Src.Addr(), p)
+	if errPkt == nil {
+		return
+	}
+	if err := tun.InjectInboundCopy(errPkt); err != nil {
+		dh.debugLogf("error injecting ICMP host unreachable packet: %v", err)
+	}
+}
+
 func (dh *datapathHandler) dnatAction(to netip.Addr) PacketAction {
 	return PacketAction(func(p *packet.Parsed) { checksum.UpdateDstAddr(p, to) })
 }
@@ -285,4 +303,12 @@ func (dh *datapathHandler) debugLogf(msg string, args ...any) {
 	if dh.debugLogging {
 		dh.logf(msg, args...)
 	}
+}
+
+// ClearAllActiveFlows removes all active flows from the datapath handler. This
+// is useful when all active flows lose meaning; for example, when switching
+// tailnets.
+func (dh *datapathHandler) ClearAllActiveFlows() {
+	dh.clientFlowTable.Clear()
+	dh.connectorFlowTable.Clear()
 }

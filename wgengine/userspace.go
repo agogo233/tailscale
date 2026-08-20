@@ -52,7 +52,6 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
-	"tailscale.com/util/singleflight"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
@@ -210,6 +209,11 @@ type Config struct {
 	// connections (e.g. DERP). Passed through to magicsock.
 	ExtraRootCAs *x509.CertPool
 
+	// DERPAppName, if non-empty, is an opaque app name string to
+	// advertise to DERP servers for stats purposes. It is passed
+	// through to magicsock.
+	DERPAppName string
+
 	// ControlKnobs is the set of control plane-provied knobs
 	// to use.
 	// If nil, defaults are used.
@@ -255,7 +259,7 @@ type Config struct {
 	// true, the packet is considered handled and is not passed to
 	// WireGuard. The pkt slice is borrowed and must be copied if
 	// the callee needs to retain it.
-	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) (handled bool)
+	OnDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) (handled bool)
 }
 
 // NewFakeUserspaceEngine returns a new userspace engine for testing.
@@ -425,6 +429,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		NetMon:         e.netMon,
 		HealthTracker:  e.health,
 		ExtraRootCAs:   conf.ExtraRootCAs,
+		DERPAppName:    conf.DERPAppName,
 		Metrics:        conf.Metrics,
 		ControlKnobs:   conf.ControlKnobs,
 		PeerByKeyFunc:  e.PeerByKey,
@@ -591,7 +596,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.linkChangeQueue.Add(func() { e.linkChange(&cd) })
 	})
 	eventbus.SubscribeFunc(ec, func(update events.PeerDiscoKeyUpdate) {
-		e.logf("wgengine: got TSMP disco key advertisement from %v via eventbus", update.Src)
+		e.logf("[v1] wgengine: got TSMP disco key advertisement from %v via eventbus", update.Src)
 		if e.magicConn == nil {
 			e.logf("wgengine: no magicConn")
 			return
@@ -606,17 +611,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 			return
 		}
 		e.magicConn.HandleDiscoKeyAdvertisement(peer.Node, pkt)
-	})
-	var tsmpRequestGroup singleflight.Group[netip.Addr, struct{}]
-	eventbus.SubscribeFunc(ec, func(req magicsock.NewDiscoKeyAvailable) {
-		if !req.NodeFirstAddr.IsValid() {
-			return
-		}
-		go tsmpRequestGroup.Do(req.NodeFirstAddr, func() (struct{}, error) {
-			e.sendTSMPDiscoAdvertisement(req.NodeFirstAddr)
-			e.logf("wgengine: sending TSMP disco key advertisement to %v", req.NodeFirstAddr)
-			return struct{}{}, nil
-		})
 	})
 	e.eventClient = ec
 	e.logf("Engine created.")
@@ -750,6 +744,25 @@ func (e *userspaceEngine) SetPeerSessionStateFunc(fn func(key.NodePublic, PeerWi
 			fn(key.NodePublicFromRaw32(mem.B(pk[:])), peerWireGuardStateFromDevice(state))
 		}
 	})
+}
+
+// SetPeerPriorityMessageOnEstablishmentFunc registers a callback with a
+// [github.com/tailscale/wireguard-go/device.Device] to be triggered whenever
+// WireGuard establishes a new encryption keypair with an active peer, including
+// during periodic key rotation after approximately [device.RekeyAfterTime] of
+// activity.
+//
+// This callback must be cheap and must not call back into the
+// [github.com/tailscale/wireguard-go/device.Device]. The returned message must
+// not exceed [github.com/tailscale/wireguard-go/device.MaxPriorityMessageContentSize].
+func (e *userspaceEngine) SetPeerPriorityMessageOnEstablishmentFunc(fn func(key.NodePublic) (msg []byte)) {
+	if fn != nil {
+		e.wgdev.SetPriorityMessageOnEstablishmentFunc(func(pk device.NoisePublicKey) (msg []byte) {
+			return fn(key.NodePublicFromRaw32(mem.B(pk[:])))
+		})
+	} else {
+		e.wgdev.SetPriorityMessageOnEstablishmentFunc(nil)
+	}
 }
 
 // SetNetLogSource installs the [NetLogSource] consulted by the engine's
@@ -1268,7 +1281,6 @@ func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size in
 		e.magicConn.Ping(peer, res, size, cb)
 	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
-		e.sendTSMPDiscoAdvertisement(ip)
 	case "ICMP":
 		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
@@ -1387,29 +1399,6 @@ func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res
 
 	tsmpPing := packet.Generate(iph, tsmpPayload[:])
 	e.tundev.InjectOutbound(tsmpPing)
-}
-
-func (e *userspaceEngine) sendTSMPDiscoAdvertisement(ip netip.Addr) {
-	srcIP, err := e.mySelfIPMatchingFamily(ip)
-	if err != nil {
-		e.logf("getting matching node: %s", err)
-		return
-	}
-	tdka := packet.TSMPDiscoKeyAdvertisement{
-		Src: srcIP,
-		Dst: ip,
-		Key: e.magicConn.DiscoPublicKey(),
-	}
-	payload, err := tdka.Marshal()
-	if err != nil {
-		e.logf("error generating TSMP Advertisement: %s", err)
-		metricTSMPDiscoKeyAdvertisementError.Add(1)
-	} else if err := e.tundev.InjectOutbound(payload); err != nil {
-		e.logf("error sending TSMP Advertisement: %s", err)
-		metricTSMPDiscoKeyAdvertisementError.Add(1)
-	} else {
-		metricTSMPDiscoKeyAdvertisementSent.Add(1)
-	}
 }
 
 func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPPongReply)) {
@@ -1548,9 +1537,6 @@ var (
 
 	metricNumMajorChanges = clientmetric.NewCounter("wgengine_major_changes")
 	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
-
-	metricTSMPDiscoKeyAdvertisementSent  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_sent")
-	metricTSMPDiscoKeyAdvertisementError = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_error")
 )
 
 func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {

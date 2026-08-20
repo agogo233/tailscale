@@ -4,11 +4,14 @@
 package wgengine
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
-	"os"
 	"runtime"
 	"slices"
 	"sync"
@@ -19,12 +22,15 @@ import (
 	"go4.org/mem"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/derp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
@@ -259,11 +265,9 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 		t.Skipf("skipping on %q; peer MTU not supported", runtime.GOOS)
 	}
 
-	defer os.Setenv("TS_DEBUG_ENABLE_PMTUD", os.Getenv("TS_DEBUG_ENABLE_PMTUD"))
-	envknob.Setenv("TS_DEBUG_ENABLE_PMTUD", "")
+	envknob.SetenvForTest(t, "TS_DEBUG_ENABLE_PMTUD", "")
 	// Turn on debugging to help diagnose problems.
-	defer os.Setenv("TS_DEBUG_PMTUD", os.Getenv("TS_DEBUG_PMTUD"))
-	envknob.Setenv("TS_DEBUG_PMTUD", "true")
+	envknob.SetenvForTest(t, "TS_DEBUG_PMTUD", "true")
 
 	var knobs controlknobs.Knobs
 
@@ -324,57 +328,6 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 				t.Errorf("don't fragment bit set to %v, want %v, err %v", v, tt.wantP, err)
 			}
 		})
-	}
-}
-
-func TestTSMPKeyAdvertisement(t *testing.T) {
-	var knobs controlknobs.Knobs
-
-	bus := eventbustest.NewBus(t)
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, &knobs, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
-	routerCfg := &router.Config{}
-	nodeKey := nkFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	nm := &netmap.NetworkMap{
-		Peers: nodeViews([]*tailcfg.Node{
-			{
-				ID:  1,
-				Key: nodeKey,
-			},
-		}),
-		SelfNode: (&tailcfg.Node{
-			StableID:  "TESTCTRL00000001",
-			Name:      "test-node.test.ts.net",
-			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32"), netip.MustParsePrefix("fd7a:115c:a1e0:ab12:4843:cd96:0:1/128")},
-		}).View(),
-	}
-	cfg := &wgcfg.Config{
-		Addresses: nm.SelfNode.Addresses().AsSlice(),
-	}
-
-	ue.SetSelfNode(nm.SelfNode)
-	err = ue.Reconfig(cfg, routerCfg, &dns.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	addr := netip.MustParseAddr("100.100.99.1")
-	previousValue := metricTSMPDiscoKeyAdvertisementSent.Value()
-	ue.sendTSMPDiscoAdvertisement(addr)
-	if val := metricTSMPDiscoKeyAdvertisementSent.Value(); val <= previousValue {
-		errs := metricTSMPDiscoKeyAdvertisementError.Value()
-		t.Errorf("Expected 1 disco key advert, got %d, errors %d", val, errs)
-	}
-	// Remove config to have the engine shut down more consistently
-	err = ue.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{})
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -551,5 +504,88 @@ func TestCloseWaitsForLinkChange(t *testing.T) {
 	case <-done:
 	default:
 		t.Fatal("Close returned with link change work still in flight")
+	}
+}
+
+// TestDERPAppNamePlumbing tests that Config.DERPAppName makes it all
+// the way from the engine config to the ClientInfo received by an
+// in-process DERP server.
+func TestDERPAppNamePlumbing(t *testing.T) {
+	const appName = "app-name-plumbing-test"
+
+	priv := key.NewNode()
+	infoCh := make(chan derp.ClientInfo, 1)
+
+	derpSrv := derpserver.New(key.NewNode(), t.Logf)
+	derpSrv.ForTest().SetOnClientInfo(func(k key.NodePublic, info derp.ClientInfo) {
+		if k != priv.Public() {
+			return
+		}
+		select {
+		case infoCh <- info:
+		default:
+		}
+	})
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(derpSrv))
+	httpsrv.Config.ErrorLog = logger.StdLogger(t.Logf)
+	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	httpsrv.StartTLS()
+	t.Cleanup(func() {
+		httpsrv.CloseClientConnections()
+		httpsrv.Close()
+		derpSrv.Close()
+	})
+
+	stunAddr, stunCleanup := stuntest.Serve(t)
+	t.Cleanup(stunCleanup)
+
+	derpMap := &tailcfg.DERPMap{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{{
+					Name:             "t1",
+					RegionID:         1,
+					HostName:         "test-node.unused",
+					IPv4:             "127.0.0.1",
+					IPv6:             "none",
+					STUNPort:         stunAddr.Port,
+					DERPPort:         httpsrv.Listener.Addr().(*net.TCPAddr).Port,
+					InsecureForTests: true,
+				}},
+			},
+		},
+	}
+
+	bus := eventbustest.NewBus(t)
+	noopDNS, err := dns.NewNoopManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewUserspaceEngine(t.Logf, Config{
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+		DNS:           noopDNS,
+		DERPAppName:   appName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+
+	if err := e.Reconfig(&wgcfg.Config{PrivateKey: priv}, &router.Config{}, &dns.Config{}); err != nil {
+		t.Fatalf("Reconfig: %v", err)
+	}
+	e.(*userspaceEngine).magicConn.SetDERPMap(derpMap)
+
+	select {
+	case info := <-infoCh:
+		if info.AppName != appName {
+			t.Fatalf("ClientInfo.AppName = %q; want %q", info.AppName, appName)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for engine to connect to the test DERP server")
 	}
 }

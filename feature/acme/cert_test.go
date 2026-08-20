@@ -27,13 +27,13 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnlocal/ipnlocaltest"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	xacme "tailscale.com/tempfork/acme"
 	"tailscale.com/tsconst"
 	"tailscale.com/tstest"
@@ -194,9 +194,9 @@ func TestResolveCertDomain(t *testing.T) {
 			e := extOf(t, b)
 
 			if !tt.skipNetmap {
-				var allCaps set.Set[tailcfg.NodeCapability]
+				var allCaps set.Set[nodecap.Cap]
 				if tt.hasCap {
-					allCaps = set.Of(tailcfg.NodeAttrDNSSubdomainResolve)
+					allCaps = set.Of(nodecap.DNSSubdomainResolve)
 				}
 				b.ForTest().SetNetMap(&netmap.NetworkMap{
 					SelfNode: (&tailcfg.Node{}).View(),
@@ -743,12 +743,10 @@ func TestGetCertPEMWithValidity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
-			tstest.AssertNotParallel(t)
 			if tt.readOnlyMode {
-				envknob.Setenv("TS_CERT_SHARE_MODE", "ro")
+				t.Setenv("TS_CERT_SHARE_MODE", "ro")
 			} else {
-				envknob.Setenv("TS_CERT_SHARE_MODE", "")
+				t.Setenv("TS_CERT_SHARE_MODE", "")
 			}
 
 			os.RemoveAll(certDirPath)
@@ -803,6 +801,196 @@ func TestGetCertPEMWithValidity(t *testing.T) {
 				t.Errorf("wants getCertPem to be called: %v, got called %v", tt.wantIssuance, gotIssuance)
 			}
 		})
+	}
+}
+
+// TestGetCertPEMWithValidityTrimsTrailingDot verifies that an SNI
+// ServerName with a trailing dot (e.g. "example.com.") resolves to the
+// same cached certificate as the dotless form. Per RFC 6066 §3 the SNI
+// HostName carries no trailing dot, but some clients send an FQDN with
+// one; the cert store keys certs by the dotless domain, so the trailing
+// dot must be trimmed before lookup. See tailscale/tailscale#10233.
+func TestGetCertPEMWithValidityTrimsTrailingDot(t *testing.T) {
+	tstest.AssertNotParallel(t)
+
+	const testDomain = "example.com"
+	b := ipnlocaltest.NewBackend(t)
+	b.SetVarRoot(t.TempDir())
+	e := extOf(t, b)
+
+	// Set up netmap with CertDomains so resolveCertDomain works. Note
+	// CertDomains holds the dotless domain, matching what control sends.
+	b.ForTest().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{}).View(),
+		DNS: tailcfg.DNSConfig{
+			CertDomains: []string{testDomain},
+		},
+	})
+
+	certDirPath, err := certDir(b)
+	if err != nil {
+		t.Fatalf("certDir error: %v", err)
+	}
+	if _, err := e.getCertStore(b); err != nil {
+		t.Fatalf("getCertStore error: %v", err)
+	}
+	testRoot, err := certTestFS.ReadFile("testdata/rootCA.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(testRoot) {
+		t.Fatal("Unable to add test CA to the cert pool")
+	}
+	testX509Roots = roots
+	defer func() { testX509Roots = nil }()
+
+	// Store a valid, unexpired cached cert under the dotless domain.
+	os.MkdirAll(certDirPath, 0755)
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.crt"),
+		must.Get(certTestFS.ReadFile("testdata/example.com.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.key"),
+		must.Get(certTestFS.ReadFile("testdata/example.com-key.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A time at which the stored cert is valid and does not need renewal.
+	b.ForTest().SetClock(tstest.NewClock(tstest.ClockOpts{
+		Start: time.Date(2023, time.February, 20, 0, 0, 0, 0, time.UTC),
+	}))
+
+	// Fail loudly if issuance/renewal is attempted: a trailing-dot lookup
+	// must hit the cached cert, not trigger a fresh ACME order.
+	orig := getCertPEM
+	getCertPEM = func(ctx context.Context, e *extension, b *ipnlocal.LocalBackend, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
+		t.Errorf("unexpected getCertPEM call for domain %q; trailing-dot lookup should have hit the cache", domain)
+		return nil, nil
+	}
+	t.Cleanup(func() { getCertPEM = orig })
+
+	pair, err := b.GetCertPEMWithValidity(context.Background(), testDomain+".", 0)
+	if err != nil {
+		t.Fatalf("GetCertPEMWithValidity(%q) error = %v, want cached cert", testDomain+".", err)
+	}
+	if pair == nil || !pair.Cached {
+		t.Fatalf("GetCertPEMWithValidity(%q) = %+v, want cached cert", testDomain+".", pair)
+	}
+}
+
+// TestAsyncRenewalDedup checks that only one async renewal for a domain
+// is allowed at a time; multiple calls to renew the same domain should
+// be de-duplicated.
+func TestAsyncRenewalDedup(t *testing.T) {
+	tstest.AssertNotParallel(t)
+
+	const domain = "example.com"
+	b := ipnlocaltest.NewBackend(t)
+	b.SetVarRoot(t.TempDir())
+	e := extOf(t, b)
+
+	b.ForTest().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{}).View(),
+		DNS: tailcfg.DNSConfig{
+			CertDomains: []string{domain},
+		},
+	})
+
+	certDirPath, err := certDir(b)
+	if err != nil {
+		t.Fatalf("certDir error: %v", err)
+	}
+	if _, err := e.getCertStore(b); err != nil {
+		t.Fatalf("getCertStore error: %v", err)
+	}
+	testRoot, err := certTestFS.ReadFile("testdata/rootCA.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(testRoot) {
+		t.Fatal("Unable to add test CA to the cert pool")
+	}
+	testX509Roots = roots
+	defer func() { testX509Roots = nil }()
+
+	// Store a valid, cached cert under a time at which it is due for
+	// renewal (the same epoch as TestGetCertPEMWithValidity's
+	// "renewal_needed" case).
+	os.MkdirAll(certDirPath, 0755)
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.crt"),
+		must.Get(certTestFS.ReadFile("testdata/example.com.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.key"),
+		must.Get(certTestFS.ReadFile("testdata/example.com-key.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	b.ForTest().SetClock(tstest.NewClock(tstest.ClockOpts{
+		Start: time.Date(2025, time.May, 1, 0, 0, 0, 0, time.UTC),
+	}))
+
+	// Keep the first async renewal in flight so we can observe a second
+	// trigger that should be deduplicated.
+	renewalStarted := make(chan struct{}, 1)
+	renewalComplete := make(chan struct{})
+	var completeRenewalOnce sync.Once
+	completeFirstRenewal := func() { completeRenewalOnce.Do(func() { close(renewalComplete) }) }
+	defer completeFirstRenewal()
+	orig := getCertPEM
+	getCertPEM = func(ctx context.Context, e *extension, b *ipnlocal.LocalBackend, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
+		t.Logf("calling getCertPEM")
+		renewalStarted <- struct{}{}
+		<-renewalComplete
+		return nil, nil
+	}
+	t.Cleanup(func() { getCertPEM = orig })
+
+	// First trigger starts the async renewal.
+	prevGo := e.goroutinesStarted.Load()
+	pair, err := b.GetCertPEMWithValidity(context.Background(), domain, 0)
+	if err != nil {
+		t.Fatalf("first GetCertPEMWithValidity error: %v", err)
+	}
+	if pair == nil || !pair.Cached {
+		t.Fatalf("first GetCertPEMWithValidity = %+v, want cached cert", pair)
+	}
+	if got := e.goroutinesStarted.Load() - prevGo; got != 1 {
+		t.Fatalf("first call spawned %d goroutine(s), want 1 (async renewal started)", got)
+	}
+	select {
+	case <-renewalStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for async renewal to enter getCertPEM")
+	}
+
+	// A second trigger while the renewal is still in flight must be
+	// deduplicated: no new goroutine.
+	prevGo = e.goroutinesStarted.Load()
+	pair2, err := b.GetCertPEMWithValidity(context.Background(), domain, 0)
+	if err != nil {
+		t.Fatalf("second GetCertPEMWithValidity error: %v", err)
+	}
+	if pair2 == nil || !pair2.Cached {
+		t.Fatalf("second GetCertPEMWithValidity = %+v, want cached cert", pair2)
+	}
+	if got := e.goroutinesStarted.Load() - prevGo; got != 0 {
+		t.Fatalf("second call spawned %d goroutine(s), want 0 (deduplicated while renewal in flight)", got)
+	}
+
+	// Let the in-flight renewal finish and verify the marker is cleared so
+	// a later renewal can be attempted again.
+	completeFirstRenewal()
+	done := make(chan struct{})
+	go func() { e.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight async renewal goroutine to finish")
+	}
+	if e.renewingCertDomains.Contains(domain) {
+		t.Fatal("renewingCertDomains still contains domain after renewal finished")
 	}
 }
 

@@ -9,6 +9,7 @@ package conn25
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"iter"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -26,7 +28,6 @@ import (
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
-	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
@@ -45,7 +46,6 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
-	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -85,28 +85,24 @@ func init() {
 	})
 	ipnlocal.RegisterPeerAPIHandler("/v0/connector/transit-ip", handleConnectorTransitIP)
 	ipnlocal.HookReplyToDNSQueries.Add(handleHookReplyToDNSQueries)
-	localapi.Register("conn25-state", serveStateGet)
+	localapi.Register("conn25/state", serveLocalAPIStateGet)
+	ipnlocal.RegisterC2N("GET /conn25/state", serveC2NStateGet)
 }
 
 func handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r *http.Request) {
-	// TODO(tailscale/corp#39033): Remove for alpha release.
-	if !envknob.UseWIPCode() && !testenv.InTest() {
-		w.WriteHeader(http.StatusNotImplemented)
-		return
-	}
 	e, ok := ipnlocal.GetExt[*extension](h.LocalBackend())
 	if !ok {
 		http.Error(w, "miswired", http.StatusInternalServerError)
+		return
+	}
+	if !e.conn25.isConfigured() {
+		http.Error(w, "conn25 not configured", http.StatusServiceUnavailable)
 		return
 	}
 	e.handleConnectorTransitIP(h, w, r)
 }
 
 func handleHookReplyToDNSQueries(h ipnlocal.PeerAPIHandler) bool {
-	// TODO(tailscale/corp#39033): Remove for alpha release.
-	if !envknob.UseWIPCode() && !testenv.InTest() {
-		return false
-	}
 	e, ok := ipnlocal.GetExt[*extension](h.LocalBackend())
 	if !ok {
 		return false
@@ -117,8 +113,9 @@ func handleHookReplyToDNSQueries(h ipnlocal.PeerAPIHandler) bool {
 // extension is an [ipnext.Extension] managing the connector on platforms
 // that import this package.
 type extension struct {
-	conn25  *Conn25            // safe for concurrent access and only set at creation
-	backend ipnext.SafeBackend // safe for concurrent access and only set at creation
+	conn25                *Conn25            // safe for concurrent access and only set at creation
+	backend               ipnext.SafeBackend // safe for concurrent access and only set at creation
+	clearAllDatapathFlows func()             // safe for concurrent access and only set at creation
 
 	host      ipnext.Host             // set in Init, read-only after
 	ctxCancel context.CancelCauseFunc // cancels sendLoop goroutine
@@ -131,11 +128,6 @@ func (e *extension) Name() string {
 
 // Init implements [ipnext.Extension].
 func (e *extension) Init(host ipnext.Host) error {
-	// TODO(tailscale/corp#39033): Remove for alpha release.
-	if !envknob.UseWIPCode() && !testenv.InTest() {
-		return ipnext.SkipExtension
-	}
-
 	if e.ctxCancel != nil {
 		return nil
 	}
@@ -152,6 +144,7 @@ func (e *extension) Init(host ipnext.Host) error {
 	e.ctxCancel = cancel
 	go e.sendLoop(ctx)
 	dph.StartFlowExpirySweepers(ctx)
+	e.conn25.connector.startExpirySweeper(ctx)
 	return nil
 }
 
@@ -191,7 +184,7 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		if urlBase == "" {
 			return "", nil
 		}
-		return urlBase + "/dns-query", nil
+		return fmt.Sprintf("%s/dns-query?app=%s", urlBase, url.QueryEscape(app.Name)), nil
 	}); err != nil {
 		return fmt.Errorf("could not register DNS resolver scheme: %w", err)
 	}
@@ -207,11 +200,11 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 
 	// Intercept packets from the tun device and from WireGuard
 	// to perform DNAT and SNAT.
-	tun.PreFilterPacketOutboundToWireGuardAppConnectorIntercept = func(p *packet.Parsed, _ *tstun.Wrapper) filter.Response {
+	tun.PreFilterPacketOutboundToWireGuardAppConnectorIntercept = func(p *packet.Parsed, tun *tstun.Wrapper) filter.Response {
 		if !e.conn25.isConfigured() {
 			return filter.Accept
 		}
-		return dph.HandlePacketFromTunDevice(p)
+		return dph.HandlePacketFromTunDevice(p, tun)
 	}
 	tun.PostFilterPacketInboundFromWireGuardAppConnector = func(p *packet.Parsed, tun *tstun.Wrapper) filter.Response {
 		if !e.conn25.isConfigured() {
@@ -225,6 +218,11 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		}
 		e.conn25.client.resendTransitIPMapping(pkt.Dst.Addr())
 	}
+
+	// The profile state change hook needs to clear all active flows on a
+	// major change (eg. switching tailnets), so make that hook accessible
+	// to it.
+	e.clearAllDatapathFlows = dph.ClearAllActiveFlows
 
 	// Manage how we react to changes to the current node,
 	// including property changes (e.g. HostInfo, Capabilities, CapMap).
@@ -391,9 +389,27 @@ func (e *extension) onSelfChange(selfNode tailcfg.NodeView) {
 
 // profileStateChange implements the [ipnext.Hooks.ProfileStateChange] hook.
 func (e *extension) profileStateChange(loginProfile ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
-	// TODO(mzb): Handle node changes. Wipe out all config?
-	// We'll need to look at the ordering of this hook and onSelfChange.
 	e.conn25.prefsAdvertiseConnector.Store(prefs.AppConnector().Advertise)
+
+	if !sameNode {
+		// Load an empty configuration to disable conn25 entirely, since we
+		// don't yet know that it is configured on the new profile. We will
+		// know once [extension.onSelfChange] is called with a new
+		// configuration, if any.
+		e.conn25.reconfig(&config{})
+
+		// If a client changes profiles and becomes a different node, all of its
+		// existing flows lose meaning, and we should delete them so that the
+		// settings of our new environment can take over.
+		if e.clearAllDatapathFlows != nil {
+			e.clearAllDatapathFlows()
+		}
+
+		// Clear internal state, like address assignments for clients and
+		// transit IP mappings for connectors.
+		e.conn25.client.reset()
+		e.conn25.connector.reset()
+	}
 }
 
 func (e *extension) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip.Prefix] {
@@ -401,8 +417,9 @@ func (e *extension) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip
 }
 
 type appAddr struct {
-	app  string
-	addr netip.Addr
+	app         string
+	addr        netip.Addr
+	expiryEntry *list.Element
 }
 
 // Conn25 holds state for routing traffic for a domain via a connector.
@@ -443,8 +460,10 @@ func newConn25(logf logger.Logf) *Conn25 {
 		getIPSets:   getIPSets,
 	}
 	c.connector = &connector{
-		logf:      logf,
-		getIPSets: getIPSets,
+		logf:        logf,
+		getIPSets:   getIPSets,
+		clock:       tstime.StdClock{},
+		expiryQueue: list.New(),
 	}
 	return c
 }
@@ -561,7 +580,17 @@ func (c *connector) handleTransitIPRequest(n tailcfg.NodeView, peerV4 netip.Addr
 		peerMap = make(map[netip.Addr]appAddr)
 		c.transitIPs[peerAddr] = peerMap
 	}
-	peerMap[tipr.TransitIP] = appAddr{addr: tipr.DestinationIP, app: tipr.App}
+	// if there's already an entry for this peer+transitIP, clean up the expiryQueue entry
+	if prev, ok := peerMap[tipr.TransitIP]; ok && prev.expiryEntry != nil {
+		c.expiryQueue.Remove(prev.expiryEntry)
+	}
+	// create a new expiryQueue entry
+	elem := c.expiryQueue.PushBack(&transitIPExpiryEntry{
+		peerIP:    peerAddr,
+		transitIP: tipr.TransitIP,
+		createdAt: c.clock.Now(),
+	})
+	peerMap[tipr.TransitIP] = appAddr{addr: tipr.DestinationIP, app: tipr.App, expiryEntry: elem}
 	return TransitIPResponse{}
 }
 
@@ -751,6 +780,7 @@ type client struct {
 	addrsCh   chan addrs
 	getIPSets func() ipSets
 
+	// Remember to add new fields to [client.reset] if needed.
 	mu              sync.Mutex // protects the fields below
 	v4MagicIPPool   *ippool
 	v4TransitIPPool *ippool
@@ -802,6 +832,21 @@ func (c *client) reconfig() {
 	c.v4TransitIPPool = c.v4TransitIPPool.reconfig(ipSets.v4Transit)
 	c.v6MagicIPPool = c.v6MagicIPPool.reconfig(ipSets.v6Magic)
 	c.v6TransitIPPool = c.v6TransitIPPool.reconfig(ipSets.v6Transit)
+}
+
+// reset clears all internal state of [client], that are not configuration
+// passed into it.
+func (c *client) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ipSets := c.getIPSets()
+	c.v4MagicIPPool = newIPPool(ipSets.v4Magic)
+	c.v4TransitIPPool = newIPPool(ipSets.v4Transit)
+	c.v6MagicIPPool = newIPPool(ipSets.v6Magic)
+	c.v6TransitIPPool = newIPPool(ipSets.v6Transit)
+	c.assignments = addrAssignments{clock: c.assignments.clock}
+	c.byConnKey = nil
 }
 
 // getAppsForConnectorDomain returns the slice of app names which match the
@@ -1069,9 +1114,9 @@ func (e *extension) sendAddressAssignment(ctx context.Context, as addrs) (tailcf
 }
 
 type dnsResponseRewrite struct {
-	domain dnsname.FQDN
-	dst    netip.Addr
-	ttl    time.Duration
+	domain     dnsname.FQDN
+	dst        netip.Addr
+	ttlSeconds uint32
 }
 
 func makeServFail(logf logger.Logf, h dnsmessage.Header, q dnsmessage.Question) []byte {
@@ -1158,10 +1203,23 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 	//  * write the questions through as they are
 	//  * not send through the additional section
 	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
-	var answers []dnsResponseRewrite
-	var cnameChain map[dnsname.FQDN]dnsname.FQDN
+	//   * We handle A, AAAA and HTTPS type questions
+	//   * We drop all others
+
+	// Question Type HTTPS
+	if question.Type == dnsmessage.TypeHTTPS {
+		newBuf, err := rewriteHTTPSResponse(hdr, questions, &p)
+		if err != nil {
+			metricDNSResponseRewriteErrorServfail.Add(1)
+			c.logf("error rewriting HTTPS dns response: %v", err)
+			return makeServFail(c.logf, hdr, question)
+		}
+		return newBuf
+	}
+
+	// Other Question Types dropped
 	if question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA {
-		newBuf, err := c.client.rewriteDNSResponse(appName, hdr, questions, answers)
+		newBuf, err := c.client.rewriteDNSResponse(appName, hdr, questions, []dnsResponseRewrite{})
 		if err != nil {
 			metricDNSResponseRewriteUnsupportedQuestionTypeErrorServfail.Add(1)
 			c.logf("error writing empty response for unsupported type: %v", err)
@@ -1169,6 +1227,10 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		}
 		return newBuf
 	}
+
+	// Question Type A/AAAA
+	var answers []dnsResponseRewrite
+	var cnameChain map[dnsname.FQDN]dnsname.FQDN
 	for {
 		h, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
@@ -1263,7 +1325,7 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 				}
 				dstAddr = netip.AddrFrom16(r.AAAA)
 			}
-			answers = append(answers, dnsResponseRewrite{domain: queriedDomain, dst: dstAddr, ttl: time.Second * time.Duration(h.TTL)})
+			answers = append(answers, dnsResponseRewrite{domain: queriedDomain, dst: dstAddr, ttlSeconds: h.TTL})
 		default:
 			// we already checked the question was for a supported type, this answer is unexpected
 			if err := p.SkipAnswer(); err != nil {
@@ -1297,7 +1359,7 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 
 	// make an answer for each rewrite
 	for _, rw := range answers {
-		as, err := c.reserveAddresses(appName, rw.domain, rw.dst, rw.ttl)
+		as, err := c.reserveAddresses(appName, rw.domain, rw.dst, time.Duration(rw.ttlSeconds)*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -1309,12 +1371,12 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 			return nil, err
 		}
 		if rw.dst.Is4() {
-			rhdr := dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 0}
+			rhdr := dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: rw.ttlSeconds}
 			if err := b.AResource(rhdr, dnsmessage.AResource{A: as.magic.As4()}); err != nil {
 				return nil, err
 			}
 		} else if rw.dst.Is6() {
-			rhdr := dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: 0}
+			rhdr := dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: rw.ttlSeconds}
 			if err := b.AAAAResource(rhdr, dnsmessage.AAAAResource{AAAA: as.magic.As16()}); err != nil {
 				return nil, err
 			}
@@ -1331,14 +1393,78 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 	return out, nil
 }
 
+// rewriteHTTPSResponse writes through the HTTPS (type 65) answers in a DNS
+// response, stripping the ipv4hint/ipv6hint SvcParams (not obvious if we
+// should replace with magic IPs). p must be positioned at the start of the
+// answer section (i.e. questions already consumed). The additional section is
+// dropped.
+func rewriteHTTPSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, p *dnsmessage.Parser) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, hdr)
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	for _, q := range questions {
+		if err := b.Question(q); err != nil {
+			return nil, err
+		}
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	for {
+		h, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if h.Type != dnsmessage.TypeHTTPS {
+			// Only HTTPS records are expected in an HTTPS response; drop anything else.
+			if err := p.SkipAnswer(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		r, err := p.HTTPSResource()
+		if err != nil {
+			return nil, err
+		}
+		r.DeleteParam(dnsmessage.SVCParamIPv4Hint)
+		r.DeleteParam(dnsmessage.SVCParamIPv6Hint)
+		if err := b.HTTPSResource(h, r); err != nil {
+			return nil, err
+		}
+	}
+	return b.Finish()
+}
+
+// connectorTransitIPExpiry is the minimum length of time a peer+transitIP -> dstIP mapping will be held in the connector.
+// The longer this time is the larger the map will be in memory.
+// The shorter this time is the more often a client will try to use a mapping, find it doesn't exist anymore and have to re-register.
+// We are not (yet 2026-08-12) tracking either of those things, this is a guess at a reasonable duration.
+const connectorTransitIPExpiry = time.Hour
+
 type connector struct {
 	logf      logger.Logf
 	getIPSets func() ipSets
+	clock     tstime.Clock
 
+	// Remember to add new fields to [connector.reset] if needed.
 	mu sync.Mutex // protects the fields below
 	// transitIPs is a map of connector client peer IP -> client transitIPs that we update as connector client peers instruct us to, and then use to route traffic to its destination on behalf of connector clients.
 	// Note that each peer could potentially have two maps: one for its IPv4 address, and one for its IPv6 address. The transit IPs map for a given peer IP will contain transit IPs of the same family as the peer's IP.
 	transitIPs map[netip.Addr]map[netip.Addr]appAddr
+	// expiryQueue is processed by the goroutine from [connector.startExpirySweeper] so
+	// that transitIPs doesn't grow indefinitely.
+	expiryQueue *list.List
+}
+
+type transitIPExpiryEntry struct {
+	peerIP    netip.Addr
+	transitIP netip.Addr
+	createdAt time.Time
 }
 
 // realIPForTransitIPConnection is part of the implementation of the [Conn25Datapath] interface for dataflow lookups.
@@ -1346,11 +1472,7 @@ type connector struct {
 func (c *connector) realIPForTransitIPConnection(srcIP netip.Addr, transitIP netip.Addr) (netip.Addr, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	v, ok := c.lookupBySrcIPAndTransitIP(srcIP, transitIP)
-	if ok {
-		return v.addr, true
-	}
-	return netip.Addr{}, false
+	return c.lookupAddrBySrcIPAndTransitIP(srcIP, transitIP)
 }
 
 const packetFilterAllowReason = "app connector transit IP"
@@ -1370,13 +1492,94 @@ func (c *connector) packetFilterAllow(p packet.Parsed) (bool, string) {
 	return false, ""
 }
 
-func (c *connector) lookupBySrcIPAndTransitIP(srcIP, transitIP netip.Addr) (appAddr, bool) {
+func (c *connector) lookupAddrBySrcIPAndTransitIP(srcIP, transitIP netip.Addr) (netip.Addr, bool) {
 	m, ok := c.transitIPs[srcIP]
 	if !ok || m == nil {
-		return appAddr{}, false
+		return netip.Addr{}, false
 	}
 	v, ok := m[transitIP]
-	return v, ok
+	return v.addr, ok
+}
+
+// expireTransitIPs expires entries in the connector's transitIPs map that are
+// past their expiry time.
+// While the client keeps track of the datapath flow table and makes sure not
+// to expire state for flows that are in use, the connector just expires
+// peer+transitIP -> dstIP state at minimum 1 hour [connectorTransitIPExpiry]
+// after it is registered.
+// If a client tries to use a mapping that is expired the connector will send a
+// TSMP error and the client will reregister the mapping.
+// If this causes too much reregistry we can extend the expiry time or we may
+// have to track flows or similar.
+func (c *connector) expireTransitIPs(now time.Time) int {
+	removed := 0
+
+	// doChunk takes the chunk size and returns the number of removed entries and
+	// whether there's still work to do.
+	// Used to allow other goroutines a chance to grab the mutex while we work.
+	doChunk := func(n int) (int, bool) {
+		nRemoved := 0
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for i := 0; i < n; i++ {
+			front := c.expiryQueue.Front()
+			if front == nil {
+				return nRemoved, true
+			}
+			e := front.Value.(*transitIPExpiryEntry)
+			if now.Sub(e.createdAt) < connectorTransitIPExpiry {
+				// the list is ordered by createdAt there will be no entries to expire after this
+				return nRemoved, true
+			}
+			c.expiryQueue.Remove(front)
+			peerMap, ok := c.transitIPs[e.peerIP]
+			if !ok {
+				continue
+			}
+			delete(peerMap, e.transitIP)
+			nRemoved++
+			if len(peerMap) == 0 {
+				delete(c.transitIPs, e.peerIP)
+			}
+		}
+		return nRemoved, false
+	}
+
+	// handle at most 100,000 entries, don't just keep going if we have an
+	// unexpectedly large number of expiries, we will handle the backlog over time.
+	for i := 0; i < 1000; i++ {
+		nRemoved, finished := doChunk(100)
+		removed += nRemoved
+		if finished {
+			break
+		}
+	}
+	return removed
+}
+
+func (c *connector) startExpirySweeper(ctx context.Context) {
+	ticker, tickerCh := c.clock.NewTicker(5 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tickerCh:
+				c.expireTransitIPs(c.clock.Now())
+			}
+		}
+	}()
+}
+
+// reset clears all internal state of [connector], that are not configuration
+// passed into it.
+func (c *connector) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.transitIPs = make(map[netip.Addr]map[netip.Addr]appAddr)
+	c.expiryQueue = list.New()
 }
 
 type addrs struct {

@@ -34,6 +34,7 @@ const (
 	MetricProxyGroupIngressCount         = "k8s_proxygroup_ingress_resources"
 	MetricProxyGroupAPIServerCount       = "k8s_proxygroup_kube_apiserver_resources"
 	MetricTailnetCount                   = "k8s_tailnet_resources"
+	MetricPeerRelayCount                 = "k8s_peerrelay_resources"
 
 	// Keys that containerboot writes to state file that can be used to determine its state.
 	// fields set in Tailscale state Secret. These are mostly used by the Tailscale Kubernetes operator to determine
@@ -63,6 +64,28 @@ const (
 	LabelSecretTypeConfig = "config"
 	LabelSecretTypeState  = "state"
 	LabelSecretTypeCerts  = "certs"
+
+	// ACMEAccountsSecretName is the name of the Secret in the operator
+	// namespace that holds shared ACME account private keys, one field per
+	// tailnet. Sharing one account key across all replicas of every
+	// ProxyGroup attached to a tailnet preserves Let's Encrypt's renewal
+	// exemption (via the ARI "replaces" extension) across pod restarts,
+	// ProxyGroup recreation, and ingress migration.
+	ACMEAccountsSecretName = "tailscale-acme-accounts"
+
+	// ACMEAccountDefaultKey is the field used inside ACMEAccountsSecretName
+	// for the "default" tailnet (i.e., when ProxyGroup.spec.tailnet is empty
+	// and the operator uses its own credentials).
+	ACMEAccountDefaultKey = "_default"
+
+	// ACMEAccountKeySuffix is appended to the tailnet identifier to form a
+	// field name within ACMEAccountsSecretName.
+	ACMEAccountKeySuffix = ".acme-account.key.pem"
+
+	// ACMEAccountsFinalizer blocks accidental deletion of
+	// ACMEAccountsSecretName; losing those keys breaks ARI "replaces"
+	// renewals for every cert in the tailnet. See #18251.
+	ACMEAccountsFinalizer = "tailscale.com/acme-account-protection"
 
 	KubeAPIServerConfigFile                     = "config.hujson"
 	APIServerProxyModeAuth   APIServerProxyMode = "auth"

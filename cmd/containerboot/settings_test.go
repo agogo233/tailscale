@@ -7,8 +7,10 @@ package main
 
 import (
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func Test_parseAcceptDNS(t *testing.T) {
@@ -228,6 +230,78 @@ func TestValidateAuthMethods(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvEmptyDefaults(t *testing.T) {
+	tests := []struct {
+		env  string
+		get  func(*settings) string
+		want string
+	}{
+		{
+			env:  "TS_SOCKET",
+			get:  func(c *settings) string { return c.Socket },
+			want: "/tmp/tailscaled.sock",
+		},
+		{
+			env:  "TS_LOCAL_ADDR_PORT",
+			get:  func(c *settings) string { return c.LocalAddrPort },
+			want: "[::]:9002",
+		},
+		{
+			env:  "TS_TEST_ONLY_ROOT",
+			get:  func(c *settings) string { return c.Root },
+			want: "/",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			t.Setenv(tt.env, "")
+			cfg, err := configFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := tt.get(cfg); got != tt.want {
+				t.Errorf(`%s set to empty "": got %q, want default %q`, tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigFromEnvKubeSecret(t *testing.T) {
+	tests := []struct {
+		name         string
+		inKubernetes bool
+		unset        bool
+		value        string
+		want         string
+	}{
+		{name: "in_kubernetes_unset", inKubernetes: true, unset: true, want: "tailscale"},
+		{name: "in_kubernetes_empty", inKubernetes: true, value: "", want: ""},
+		{name: "in_kubernetes_set", inKubernetes: true, value: "custom", want: "custom"},
+		{name: "not_in_kubernetes_unset", inKubernetes: false, unset: true, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// t.Setenv registers a t.Cleanup to restore the original value, so
+			// route the unset cases through it rather than a bare os.Unsetenv.
+			t.Setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+			if !tt.inKubernetes {
+				os.Unsetenv("KUBERNETES_SERVICE_HOST")
+			}
+			t.Setenv("TS_KUBE_SECRET", tt.value)
+			if tt.unset {
+				os.Unsetenv("TS_KUBE_SECRET")
+			}
+			cfg, err := configFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.KubeSecret != tt.want {
+				t.Errorf("KubeSecret = %q, want %q", cfg.KubeSecret, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandlesKubeIPV6(t *testing.T) {
 	t.Setenv("TS_LOCAL_ADDR_PORT", "fd7a:115c:a1e0::6c34:352:9002")
 	t.Setenv("POD_IPS", "fd7a:115c:a1e0::6c34:352")
@@ -252,5 +326,44 @@ func TestHandlesKubeIPV6(t *testing.T) {
 
 	if parsed.Port() != 9002 {
 		t.Errorf("expected port 9002 but got %d", parsed.Port())
+	}
+}
+
+func TestBootCtxTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		// value is the TS_BOOT_TIMEOUT value to set; unset is true to leave
+		// the env var absent entirely.
+		value string
+		unset bool
+		// want is the expected BootCtxTimeout when wantErr is false.
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "unset_defaults_to_60s", unset: true, want: 60 * time.Second},
+		{name: "empty_defaults_to_60s", value: "", want: 60 * time.Second},
+		{name: "valid_override", value: "3m", want: 3 * time.Minute},
+		{name: "invalid_value_is_rejected", value: "90", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TS_BOOT_TIMEOUT", tt.value)
+			if tt.unset {
+				os.Unsetenv("TS_BOOT_TIMEOUT")
+			}
+			cfg, err := configFromEnv()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("configFromEnv() succeeded, want error for TS_BOOT_TIMEOUT=%q", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.BootCtxTimeout != tt.want {
+				t.Errorf("BootCtxTimeout = %v, want %v", cfg.BootCtxTimeout, tt.want)
+			}
+		})
 	}
 }

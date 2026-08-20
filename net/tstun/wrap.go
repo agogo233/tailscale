@@ -25,6 +25,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/net/batching"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/routemanager"
@@ -761,6 +762,14 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConf
 		}
 	}
 
+	// TSMP traffic should only originate from tailscaled, not from the host
+	// itself.
+	if p.IPProto == ipproto.TSMP {
+		t.limitedLogf("[unexpected] received TSMP out packet over tstun; dropping")
+		metricPacketOutDropTSMP.Add(1)
+		return filter.DropSilently, gro
+	}
+
 	// Issue 1526 workaround: if we sent disco packets over
 	// Tailscale from ourselves, then drop them, as that shouldn't
 	// happen unless a networking stack is confused, as it seems
@@ -1097,7 +1106,8 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.injectOutboundPong(p, pingReq)
 			return filter.DropSilently, gro
 		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
-			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
+			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") &&
+				!discoKeyAdvert.Key.IsZero() {
 				t.discoKeyAdvertisementPub.Publish(events.DiscoKeyAdvertisement{
 					Src: discoKeyAdvert.Src,
 					Key: discoKeyAdvert.Key,
@@ -1478,7 +1488,7 @@ func (t *Wrapper) BatchSize() int {
 		// Linux, and we cannot make a determination on gVisor usage at
 		// wireguard-go.Device startup, which is when this value matters for
 		// packet memory init.
-		return conn.IdealBatchSize
+		return batching.BatchSizeFromEnv(conn.IdealBatchSize)
 	}
 	return t.tdev.BatchSize()
 }
@@ -1506,6 +1516,7 @@ var (
 	metricPacketOutDrop          = clientmetric.NewCounter("tstun_out_to_wg_drop")
 	metricPacketOutDropFilter    = clientmetric.NewCounter("tstun_out_to_wg_drop_filter")
 	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
+	metricPacketOutDropTSMP      = clientmetric.NewCounter("tstun_out_to_wg_drop_tsmp")
 )
 
 func (t *Wrapper) InstallCaptureHook(cb packet.CaptureCallback) {
