@@ -116,6 +116,21 @@
 //	})
 //	log.Printf("Listening on https://%s", ln.FQDN)
 //
+// # Using an exit node
+//
+// A tsnet node can route its [Server.Dial] traffic to non-tailnet
+// addresses through an [exit node]. Select the exit node by setting the
+// ExitNodeID pref via [Server.LocalClient]:
+//
+//	lc, _ := srv.LocalClient()
+//	_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+//		Prefs:         ipn.Prefs{ExitNodeID: "nodeid"},
+//		ExitNodeIDSet: true,
+//	})
+//
+// Dials of addresses outside the tailnet then go through the exit node.
+// Dials within the tailnet are unaffected.
+//
 // # Running multiple nodes in one process
 //
 // Each [Server] instance is an independent node. Give each a unique
@@ -132,6 +147,7 @@
 //	}
 //
 // [Tailscale identity]: https://tailscale.com/docs/concepts/tailscale-identity
+// [exit node]: https://tailscale.com/docs/features/exit-nodes
 // [Tailscale Funnel]: https://tailscale.com/docs/features/tailscale-funnel
 // [Tailscale Service]: https://tailscale.com/docs/features/tailscale-services
 package tsnet
@@ -397,12 +413,16 @@ func (s *Server) awaitRunning(ctx context.Context) error {
 //
 // This is useful if you need to have your tsnet services connect to other devices on
 // your tailnet.
+//
+// The returned client's transport has the same settings as
+// [http.DefaultTransport], except its DialContext dials over Tailscale
+// and it has no Proxy set, as HTTP proxies from the environment are
+// unlikely to be reachable over the tailnet.
 func (s *Server) HTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: s.Dial,
-		},
-	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = s.Dial
+	tr.Proxy = nil
+	return &http.Client{Transport: tr}
 }
 
 // LocalClient returns a LocalClient that speaks to s.
@@ -666,7 +686,16 @@ func (s *Server) close() {
 	}
 
 	wg.Wait()
-	s.sys.Bus.Get().Close()
+	// s.sys is only assigned partway through doInit, so it is still nil if
+	// Start failed before that point. Close is reachable in that state --
+	// Start is idempotent via initOnce and returns the stored initErr, so
+	// callers that `defer Close()` before checking the error land here.
+	// Use GetOK rather than Get so an unset Bus cannot panic either.
+	if s.sys != nil {
+		if bus, ok := s.sys.Bus.GetOK(); ok && bus != nil {
+			bus.Close()
+		}
+	}
 }
 
 func (s *Server) doInit() {
