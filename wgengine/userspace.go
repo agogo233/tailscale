@@ -109,11 +109,11 @@ type userspaceEngine struct {
 	// for the cold-path control lookups (Ping, TSMP, pendopen, etc).
 	peerForIPFn atomic.Pointer[func(netip.Addr) (_ PeerForIP, ok bool)]
 
-	// peerConfigFn, if non-nil, is the live per-peer allowed-IPs
+	// peerConfigFn, if non-nil, is the live per-peer WireGuard config
 	// source installed via [userspaceEngine.SetPeerConfigFunc]. When
 	// set, wgdev's PeerLookupFunc queries it directly, so reconfigs
 	// no longer install per-config lookup closures.
-	peerConfigFn atomic.Pointer[func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)]
+	peerConfigFn atomic.Pointer[func(key.NodePublic) (config wgcfg.PeerConfig, ok bool)]
 
 	lastCfg        wgcfg.Config
 	lastRouter     *router.Config
@@ -595,7 +595,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 		e.linkChangeQueue.Add(func() { e.linkChange(&cd) })
 	})
-	eventbus.SubscribeFunc(ec, func(update events.PeerDiscoKeyUpdate) {
+	eventbus.SubscribeFunc(ec, func(update events.DiscoKeyAdvertisement) {
 		e.logf("[v1] wgengine: got TSMP disco key advertisement from %v via eventbus", update.Src)
 		if e.magicConn == nil {
 			e.logf("wgengine: no magicConn")
@@ -672,14 +672,14 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 
 // SetPeerConfigFunc implements [Engine.SetPeerConfigFunc]. It stores
 // fn and installs a single wgdev PeerLookupFunc wrapping it, so
-// lazily-created peers always get current allowed IPs and the lookup
+// lazily-created peers always get their current config and the lookup
 // func never needs to be reinstalled as the peer set changes.
-func (e *userspaceEngine) SetPeerConfigFunc(fn func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)) {
+func (e *userspaceEngine) SetPeerConfigFunc(fn func(key.NodePublic) (config wgcfg.PeerConfig, ok bool)) {
 	if fn == nil {
 		panic("SetPeerConfigFunc: nil fn")
 	}
 	e.peerConfigFn.Store(&fn)
-	e.wgdev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(e.wgdev.Bind(), e.logf, func(pubk device.NoisePublicKey) ([]netip.Prefix, bool) {
+	e.wgdev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(e.wgdev.Bind(), e.logf, func(pubk device.NoisePublicKey) (wgcfg.PeerConfig, bool) {
 		return fn(key.NodePublicFromRaw32(mem.B(pubk[:])))
 	}))
 }
@@ -695,22 +695,23 @@ func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
 	// The peer set may be about to change; drop the wgLogger's cached
 	// peer-string rewrites so the next log line re-resolves them.
 	e.wgLogger.Invalidate()
-	allowedIPs, ok := (*fn)(k)
+	conf, ok := (*fn)(k)
 	if !ok {
 		e.wgdev.RemovePeer(k.Raw32())
 		return
 	}
 	if peer, ok := e.wgdev.LookupActivePeer(k.Raw32()); ok {
-		peer.SetAllowedIPs(allowedIPs)
+		peer.SetPresharedKey(conf.PresharedKey)
+		peer.SetAllowedIPs(conf.AllowedIPs)
 	}
 }
 
-// ResetDevicePeer implements [Engine.ResetDevicePeer].
-func (e *userspaceEngine) ResetDevicePeer(k key.NodePublic) {
+// MarkDevicePeerForHandshake implements [Engine.MarkDevicePeerForHandshake].
+func (e *userspaceEngine) MarkDevicePeerForHandshake(k key.NodePublic) {
 	e.wgLock.Lock()
 	defer e.wgLock.Unlock()
 	e.wgLogger.Invalidate()
-	e.wgdev.RemovePeer(k.Raw32())
+	e.wgdev.ScheduleHandshakeOnUserSend(k.Raw32())
 }
 
 // SetPeerByIPPacketFunc installs a callback used by wireguard-go to look up
