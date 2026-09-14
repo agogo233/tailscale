@@ -13,6 +13,13 @@ env:
   GOARCH: amd64
   CGO_ENABLED: 0
 
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,13 +30,15 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: 1.26.3
+          go-version-file: go.mod
           cache: true
 
       - name: Generate version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          if [ -n "${{ inputs.version_override }}" ]; then
-            VERSION_SHORT="${{ inputs.version_override }}"
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            VERSION_SHORT="$VERSION_OVERRIDE"
             VERSION_LONG="${VERSION_SHORT}-$(git rev-parse --short HEAD)"
             VERSION_GIT_HASH="$(git rev-parse HEAD)"
           else
@@ -60,7 +69,7 @@ jobs:
           USE_PROCD=1
           start_service() {
               procd_open_instance
-              procd_set_param command /usr/sbin/tailscaled
+              procd_set_param command /usr/sbin/tailscaled --state /etc/tailscale/tailscaled.state
               procd_set_param stdout 1
               procd_set_param stderr 1
               procd_close_instance
@@ -116,3 +125,43 @@ jobs:
         with:
           name: tailscale_x86_64
           path: tailscale_*_x86_64.ipk
+
+      - name: Publish rolling latest Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build/release
+          cp build/data/usr/bin/tailscale      build/release/tailscale
+          cp build/data/usr/sbin/tailscaled    build/release/tailscaled
+          cp tailscale_*_openwrt_x86_64.tgz    build/release/tailscale_openwrt_x86_64.tgz
+          cp tailscale_*_x86_64.ipk            build/release/tailscale_x86_64.ipk
+
+          cat > build/release-notes.md <<EOF
+          ## Tailscale ${VERSION_SHORT} for OpenWrt x86_64
+
+          - 版本: \`${VERSION_LONG}\`
+          - Commit: \`${GITHUB_SHA}\`
+
+          ### 固定下载地址（永不变化）
+
+          - [tailscale](https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/tailscale)
+          - [tailscaled](https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/tailscaled)
+          - [tailscale_openwrt_x86_64.tgz](https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/tailscale_openwrt_x86_64.tgz)
+          - [tailscale_x86_64.ipk](https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/tailscale_x86_64.ipk)
+
+          ### OpenWrt 一键安装
+
+          \`\`\`sh
+          wget -O- https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install-openwrt.sh | sh
+          \`\`\`
+          EOF
+
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --title "Tailscale ${VERSION_SHORT} (OpenWrt x86_64)" \
+            --notes-file build/release-notes.md \
+            build/release/tailscale \
+            build/release/tailscaled \
+            build/release/tailscale_openwrt_x86_64.tgz \
+            build/release/tailscale_x86_64.ipk
