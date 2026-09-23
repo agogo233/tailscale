@@ -44,8 +44,12 @@ import (
 	"tailscale.com/wgengine/filter"
 )
 
-// initListenConfig, if non-nil, is called during peerAPIListener setup.  It is used only
-// on iOS and macOS to set socket options to bind the listener to the Tailscale interface.
+// initListenConfig, if non-nil, is called during peerAPIListener setup.
+// On iOS and macOS, it sets socket options to bind the listener to the
+// Tailscale interface. On Linux, it binds the listener to the tunnel
+// interface, since peerapi traffic from other nodes is served by
+// netstack in userspace and the kernel listener only needs to serve
+// the local host.
 var initListenConfig func(config *net.ListenConfig, addr netip.Addr, tunIfIndex int) error
 
 // peerDNSQueryHandler is implemented by tsdns.Resolver.
@@ -73,13 +77,10 @@ func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, 
 	if initListenConfig != nil {
 		// On iOS/macOS, this sets the lc.Control hook to
 		// setsockopt the interface index to bind to, to get
-		// out of the network sandbox.
-
-		// A zero tunIfIndex is invalid for peerapi.  A zero value will not get us
-		// out of the network sandbox.  Caller should log and retry.
-		if tunIfIndex == 0 {
-			return nil, fmt.Errorf("peerapi: cannot listen on %s with tunIfIndex 0", ipStr)
-		}
+		// out of the network sandbox. On Linux, it binds the
+		// listener to the tunnel interface so the kernel does
+		// not answer peerapi handshakes from the physical
+		// network; see initListenConfigTun.
 
 		if err := initListenConfig(&lc, ip, tunIfIndex); err != nil {
 			return nil, err
@@ -832,9 +833,14 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 	q, publicError := dohQuery(r)
 	if publicError != "" && r.Method == "GET" {
 		if name := r.FormValue("q"); name != "" {
-			pretty = true
-			publicError = ""
-			q = dnsQueryForName(name, r.FormValue("t"))
+			nameQuery, err := dnsQueryForName(name, r.FormValue("t"))
+			if err != nil {
+				publicError = "invalid name in ‘q’ parameter"
+			} else {
+				pretty = true
+				publicError = ""
+				q = nameQuery
+			}
 		}
 	}
 	if publicError != "" {
@@ -913,7 +919,10 @@ func dohQuery(r *http.Request) (dnsQuery []byte, publicErr string) {
 	}
 }
 
-func dnsQueryForName(name, typStr string) []byte {
+// dnsQueryForName builds a DNS query for name, which comes from the caller of
+// the peerAPI DNS debug mode and is not otherwise validated. It returns an
+// error if name does not fit in a DNS message.
+func dnsQueryForName(name, typStr string) ([]byte, error) {
 	typ := dnsmessage.TypeA
 	switch strings.ToLower(typStr) {
 	case "aaaa":
@@ -921,22 +930,27 @@ func dnsQueryForName(name, typStr string) []byte {
 	case "txt":
 		typ = dnsmessage.TypeTXT
 	}
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	qname, err := dnsmessage.NewName(name)
+	if err != nil {
+		return nil, err
+	}
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		OpCode:           0, // query
 		RecursionDesired: true,
 		ID:               1, // arbitrary, but 0 is rejected by some servers
 	})
-	if !strings.HasSuffix(name, ".") {
-		name += "."
-	}
 	b.StartQuestions()
-	b.Question(dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(name),
+	if err := b.Question(dnsmessage.Question{
+		Name:  qname,
 		Type:  typ,
 		Class: dnsmessage.ClassINET,
-	})
-	msg, _ := b.Finish()
-	return msg
+	}); err != nil {
+		return nil, err
+	}
+	return b.Finish()
 }
 
 func writePrettyDNSReply(w io.Writer, res []byte) (err error) {

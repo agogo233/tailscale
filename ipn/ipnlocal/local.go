@@ -711,6 +711,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		b.onTailnetDefaultAutoUpdate(au.Value)
 	})
 	eventbus.SubscribeFunc(ec, func(cd netmon.ChangeDelta) { b.linkChange(&cd) })
+	b.refreshInterfaceState(netMon)
 	if buildfeatures.HasHealth {
 		eventbus.SubscribeFunc(ec, b.onHealthChange)
 	}
@@ -1170,6 +1171,27 @@ func (b *LocalBackend) DisconnectControl() {
 	}
 }
 
+// refreshInterfaceState applies netMon's current interface state as a link
+// change if it differs from the state b last saw. [NewLocalBackend] calls it
+// right after subscribing to [netmon.ChangeDelta] events, to pick up a change
+// published between its initial snapshot and that subscription.
+func (b *LocalBackend) refreshInterfaceState(netMon *netmon.Monitor) {
+	cur := netMon.InterfaceState()
+	b.mu.Lock()
+	old := b.interfaceState
+	b.mu.Unlock()
+	if old.Equal(cur) {
+		return
+	}
+	cd, err := netmon.NewChangeDelta(old, cur, 0, false)
+	if err != nil {
+		b.logf("[unexpected] refreshInterfaceState: %v", err)
+		return
+	}
+	b.logf("refreshInterfaceState: network changed during LocalBackend construction")
+	b.linkChange(cd)
+}
+
 // linkChange is our network monitor callback, called whenever the network changes.
 func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	b.mu.Lock()
@@ -1499,6 +1521,7 @@ func (b *LocalBackend) updateStatusLocked(sb *ipnstate.StatusBuilder) {
 			s.CurrentTailnet.MagicDNSSuffix = nm.MagicDNSSuffix()
 			s.CurrentTailnet.MagicDNSEnabled = nm.DNS.Proxied
 			s.CurrentTailnet.Name = nm.Domain
+			s.CurrentTailnet.StableID = nm.StableTailnetID()
 			if prefs := b.pm.CurrentPrefs(); prefs.Valid() {
 				if !prefs.RouteAll() && nm.AnyPeersAdvertiseRoutes() {
 					s.Health = append(s.Health, healthmsg.WarnAcceptRoutesOff)
@@ -2071,7 +2094,7 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 
 		// Notify watchers that the self node may have changed. Reactive
 		// consumers (containerboot, kube agents, sniproxy, etc.) listen on
-		// this signal and re-fetch peers/DNS via [LocalClient.NetMap] if
+		// this signal and re-fetch peers/DNS via other LocalAPI methods if
 		// they need more than self info.
 		var selfChange *tailcfg.Node
 		if st.NetMap.SelfNode.Valid() {
@@ -2084,9 +2107,6 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 			for _, p := range st.NetMap.Peers {
 				notify.PeersChanged = append(notify.PeersChanged, p.AsStruct())
 			}
-		}
-		if goosGetsLegacyNetmapNotify {
-			notify.NetMap = st.NetMap
 		}
 		b.sendLocked(notify)
 
@@ -2594,9 +2614,6 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 			notify.PeerChangedPatch = patches
 		} else if !ok {
 			b.logf("[unexpected] got mutations worthy of telling IPN bus but failed to convert to peer changes")
-		}
-		if goosGetsLegacyNetmapNotify {
-			notify.NetMap = cn.netMapWithPeers()
 		}
 	} else if testenv.InTest() {
 		// In tests, send an empty Notify as a wake-up so end-to-end
@@ -3188,6 +3205,15 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 	if envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
 		if nm, ok := b.loadDiskCacheLocked(); ok {
 			logf("loaded netmap from disk cache; %d peers", len(nm.Peers))
+
+			// A connected controlclient updates controlknobs in response to non
+			// keep-alive map responses, so do the same upon loading a netamp from
+			// the cache. The validity check here should not be necessary, as the
+			// cache won't store or vend a netmap without a valid self node, but
+			// we'll do it anyway as a defensive measure.
+			if self := nm.SelfNode; self.Valid() {
+				b.sys.ControlKnobs().UpdateFromNodeAttributes(self.CapMap().AsMap())
+			}
 			b.setControlClientStatusLocked(nil, controlclient.Status{
 				NetMap:   nm,
 				LoggedIn: true, // sure
@@ -3747,7 +3773,13 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 	// channel before InitialStatus is delivered.
 	var statusSB *ipnstate.StatusBuilder
 	if mask&ipn.NotifyInitialStatus != 0 {
-		statusSB = &ipnstate.StatusBuilder{WantPeers: true}
+		// The initial status is sized to the subscription: building the
+		// per-peer status entries is O(peers), so only do it for watchers
+		// that subscribed to peer deltas and thus need a peer baseline to
+		// apply them to. Self-only watchers get Status.Self and the
+		// scalar fields.
+		wantPeers := mask&(ipn.NotifyPeerChanges|ipn.NotifyPeerPatches) != 0
+		statusSB = &ipnstate.StatusBuilder{WantPeers: wantPeers}
 		b.e.UpdateStatus(statusSB)
 	}
 	if mask&ipn.NotifyPeerWireGuardState != 0 {
@@ -3762,11 +3794,10 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 
 	var policyUID string
 	const initialBits = ipn.NotifyInitialState | ipn.NotifyInitialPrefs |
-		ipn.NotifyInitialNetMap | ipn.NotifyInitialStatus |
+		ipn.NotifyInitialStatus |
 		ipn.NotifyInitialDriveShares | ipn.NotifyInitialSuggestedExitNode |
 		ipn.NotifyInitialClientVersion | ipn.NotifySysPolicyChanges | ipn.NotifyPeerWireGuardState
 	if mask&initialBits != 0 {
-		cn := b.currentNode()
 		ini = &ipn.Notify{Version: version.Long()}
 		if mask&ipn.NotifyInitialState != 0 {
 			ini.SessionID = sessionID
@@ -3777,16 +3808,6 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 		}
 		if mask&ipn.NotifyInitialPrefs != 0 {
 			ini.Prefs = new(b.sanitizedPrefsLocked())
-		}
-		if mask&ipn.NotifyInitialNetMap != 0 {
-			if nm := cn.NetMap(); nm != nil && nm.SelfNode.Valid() {
-				ini.SelfChange = nm.SelfNode.AsStruct()
-			}
-			// The legacy initial NetMap is delivered cross-platform: it
-			// is what watchers asked for by setting NotifyInitialNetMap
-			// and is always a one-shot, so the cost of building it is
-			// paid once per bus subscription.
-			ini.NetMap = cn.netMapWithPeers()
 		}
 		if statusSB != nil {
 			b.updateStatusLocked(statusSB)
@@ -3886,14 +3907,16 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 	// TODO(marwan-at-work): streaming background logs?
 	defer b.DeleteForegroundSession(sessionID)
 
-	sender := &rateLimitingBusSender{fn: fn}
-	defer sender.close()
-
-	if mask&ipn.NotifyRateLimit != 0 {
-		sender.interval = 3 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case n, ok := <-ch:
+			if !ok || !fn(n) {
+				return
+			}
+		}
 	}
-
-	sender.Run(ctx, ch)
 }
 
 // appendHealthActions returns an IPN listener func that wraps the supplied IPN
@@ -4150,7 +4173,6 @@ func (b *LocalBackend) notifyForSessionLocked(sess *watchSession, n *ipn.Notify)
 	// the watcher doesn't have to handle the patch shape.
 	wantsPeerChanges := sess.mask&(ipn.NotifyPeerChanges|ipn.NotifyPeerPatches) != 0
 	wantsPeerPatches := sess.mask&ipn.NotifyPeerPatches != 0
-	stripNetMap := goosGetsLegacyNetmapNotify && n.NetMap != nil && sess.mask&ipn.NotifyNoNetMap != 0
 	stripPeersChanged := len(n.PeersChanged) > 0 && !wantsPeerChanges
 	stripPeersRemoved := len(n.PeersRemoved) > 0 && !wantsPeerChanges
 	stripPatches := len(n.PeerChangedPatch) > 0 && !wantsPeerPatches
@@ -4185,13 +4207,10 @@ func (b *LocalBackend) notifyForSessionLocked(sess *watchSession, n *ipn.Notify)
 	}
 	replaceUserProfiles := !stripUserProfiles && len(sessUserProfiles) != len(n.UserProfiles)
 
-	if !stripNetMap && !stripPeersChanged && !stripPeersRemoved && !stripPatches && !stripPeerState && !stripUserProfiles && !replaceUserProfiles && !promotePatches {
+	if !stripPeersChanged && !stripPeersRemoved && !stripPatches && !stripPeerState && !stripUserProfiles && !replaceUserProfiles && !promotePatches {
 		return n
 	}
 	nCopy := *n
-	if stripNetMap {
-		nCopy.NetMap = nil
-	}
 	if stripPeersChanged {
 		nCopy.PeersChanged = nil
 	}
@@ -4857,16 +4876,16 @@ func (b *LocalBackend) switchToBestProfileLocked(reason string) {
 		}
 	case !switched:
 		if err != nil {
-			b.logf("%s: an error occurred; staying on profile %q (%s): %v", reason, cp.UserProfile().LoginName, cp.ID(), err)
+			b.logf("%s: an error occurred; staying on profile %q (%s): %v", reason, cp.UserProfile().LoginName(), cp.ID(), err)
 		} else {
-			b.logf("%s: staying on profile %q (%s)", reason, cp.UserProfile().LoginName, cp.ID())
+			b.logf("%s: staying on profile %q (%s)", reason, cp.UserProfile().LoginName(), cp.ID())
 		}
 	case cp.ID() == "":
 		b.logf("%s: disconnecting Tailscale", reason)
 	case background:
-		b.logf("%s: switching to background profile %q (%s)", reason, cp.UserProfile().LoginName, cp.ID())
+		b.logf("%s: switching to background profile %q (%s)", reason, cp.UserProfile().LoginName(), cp.ID())
 	default:
-		b.logf("%s: switching to profile %q (%s)", reason, cp.UserProfile().LoginName, cp.ID())
+		b.logf("%s: switching to profile %q (%s)", reason, cp.UserProfile().LoginName(), cp.ID())
 	}
 	if !switched {
 		return
@@ -6450,6 +6469,20 @@ func (b *LocalBackend) initPeerAPIListenerLocked() {
 			// We don't care about the error here.  Not all platforms set this.
 			// If ps.listen needs it, it will check for zero values and error out.
 			tsIfIndex, _ := netmon.TailscaleInterfaceIndex()
+			if tsIfIndex == 0 {
+				// tailscaled sets the interface props at startup, but tsnet
+				// users of LocalBackend that don't run that code leave them
+				// unset. When there is a tun, derive the index from the
+				// device itself; peerapi uses it to bind its listener to
+				// the tunnel interface.
+				if tun, ok := b.sys.Tun.GetOK(); ok {
+					if name, err := tun.Name(); err == nil {
+						if iface, err := net.InterfaceByName(name); err == nil {
+							tsIfIndex = iface.Index
+						}
+					}
+				}
+			}
 
 			ln, err = ps.listen(a.Addr(), tsIfIndex)
 			if err != nil {
@@ -8081,7 +8114,7 @@ func (s netLogNodeSource) NodeByAddr(addr netip.Addr) (_ tailcfg.NodeView, _ tai
 // flow logging identity from the current netmap. ok is false if the
 // netmap does not enable network flow logging for this node.
 func (s netLogNodeSource) NetLogIDs() (nodeID, domainID logid.PrivateID, logExitFlows bool, ok bool) {
-	nm := s.b.NetMap()
+	nm := s.b.NetMapNoPeers()
 	if nm == nil || !nm.SelfNode.Valid() {
 		return
 	}
