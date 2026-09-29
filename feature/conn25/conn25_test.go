@@ -58,7 +58,6 @@ func mustIPSetFromPrefix(s string) *netipx.IPSet {
 // request with a transit addr and a destination addr we store that mapping
 // and can retrieve it.
 func TestHandleConnectorTransitIPRequest(t *testing.T) {
-
 	const appName = "TestApp"
 	const invalidAppName = "InvalidApp"
 
@@ -69,11 +68,18 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 	pipV6_1 := netip.MustParseAddr("fd7a:115c:a1e0::101")
 	pipV6_3 := netip.MustParseAddr("fd7a:115c:a1e0::103")
 
-	// Transit IPs
-	tipV4_1 := netip.MustParseAddr("0.0.0.1")
-	tipV4_2 := netip.MustParseAddr("0.0.0.2")
+	// Transit IPs, from the pools configured on the connector below.
+	tipV4_1 := netip.MustParseAddr("169.254.0.1")
+	tipV4_2 := netip.MustParseAddr("169.254.0.2")
 
 	tipV6_1 := netip.MustParseAddr("FE80::1")
+
+	// Transit IPs from outside of the configured pools.
+	tipV4Outside := netip.MustParseAddr("192.0.2.1")
+	tipV6Outside := netip.MustParseAddr("2001:db8::1")
+
+	// tipV4_1 written in its IPv4-in-IPv6 form; the same address as tipV4_1.
+	tipV4_1In6 := netip.MustParseAddr("::ffff:169.254.0.1")
 
 	// Destination IPs
 	dipV4_1 := netip.MustParseAddr("10.0.0.1")
@@ -221,10 +227,12 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 				}},
 			},
 			wants: []ConnectorTransitIPResponse{
-				{TransitIPs: []TransitIPResponse{
-					{Code: OK, Message: ""},
-					{Code: DuplicateTransitIP, Message: dupeTransitIPMessage},
-					{Code: OK, Message: ""}},
+				{
+					TransitIPs: []TransitIPResponse{
+						{Code: OK, Message: ""},
+						{Code: DuplicateTransitIP, Message: dupeTransitIPMessage},
+						{Code: OK, Message: ""},
+					},
 				},
 			},
 			wantLookups: [][][]netip.Addr{
@@ -375,6 +383,70 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 				{},
 			},
 		},
+		// Single peer, ipv4 transit IP from outside the configured pool
+		{
+			name:         "one-peer-tip-not-in-pool-ipv4",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4Outside, DestinationIP: dipV4_1, App: appName}}},
+			},
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: TransitIPNotInPool, Message: transitIPNotInPoolMessage}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4Outside, netip.Addr{}}},
+			},
+		},
+		// Single peer, ipv6 transit IP from outside the configured pool
+		{
+			name:         "one-peer-tip-not-in-pool-ipv6",
+			ctipReqPeers: []tailcfg.NodeView{peerV6Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV6Outside, DestinationIP: dipV6_1, App: appName}}},
+			},
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: TransitIPNotInPool, Message: transitIPNotInPoolMessage}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV6_3, tipV6Outside, netip.Addr{}}},
+			},
+		},
+		// Single peer, an out of pool transit IP does not stop the other
+		// mappings in the request from being processed.
+		{
+			name:         "one-peer-multi-map-tip-not-in-pool",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{
+					{TransitIP: tipV4Outside, DestinationIP: dipV4_1, App: appName},
+					{TransitIP: tipV4_2, DestinationIP: dipV4_2, App: appName},
+				}},
+			},
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{
+					{Code: TransitIPNotInPool, Message: transitIPNotInPoolMessage},
+					{Code: OK, Message: ""},
+				}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4Outside, netip.Addr{}}, {pipV4_2, tipV4_2, dipV4_2}},
+			},
+		},
+		// Single peer, a transit IP in its IPv4-in-IPv6 form is canonicalized
+		// and stored unmapped.
+		{
+			name:         "one-peer-tip-4in6",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1In6, DestinationIP: dipV4_1, App: appName}}},
+			},
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: OK, Message: ""}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4_1, dipV4_1}, {pipV4_2, tipV4_1In6, netip.Addr{}}},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -399,6 +471,10 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 					appName: {
 						Name: appName,
 					},
+				},
+				ipSets: ipSets{
+					v4Transit: mustIPSetFromPrefix("169.254.0.0/24"),
+					v6Transit: mustIPSetFromPrefix("fe80::/64"),
 				},
 			})
 
@@ -639,7 +715,8 @@ func TestConfigFromNodeView(t *testing.T) {
 				"a.example.com.": {"one"},
 				"b.example.com.": {"two"},
 			},
-			wantAppsByWCDomain: map[dnsname.FQDN][]string{}},
+			wantAppsByWCDomain: map[dnsname.FQDN][]string{},
+		},
 		{
 			name: "wildcard-collapse-and-deduplication",
 			appCfg: []appctype.Conn25Attr{
@@ -862,9 +939,7 @@ func makeSelfNode(t *testing.T, attrs []appctype.Conn25Attr, pools appctype.Conn
 	}).View()
 }
 
-var (
-	testPrefsNotConnector = (&ipn.Prefs{AppConnector: ipn.AppConnectorPrefs{Advertise: false}}).View()
-)
+var testPrefsNotConnector = (&ipn.Prefs{AppConnector: ipn.AppConnectorPrefs{Advertise: false}}).View()
 
 func mustConfig(t *testing.T, selfNode tailcfg.NodeView) *config {
 	t.Helper()
@@ -984,40 +1059,40 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 	for _, ans := range answers {
 		switch ans.Header.Type {
 		case dnsmessage.TypeA:
-			body, _ := (ans.Body).(*dnsmessage.AResource)
+			body, _ := ans.Body.(*dnsmessage.AResource)
 			b.AResource(ans.Header, *body)
 		case dnsmessage.TypeAAAA:
-			body, _ := (ans.Body).(*dnsmessage.AAAAResource)
+			body, _ := ans.Body.(*dnsmessage.AAAAResource)
 			b.AAAAResource(ans.Header, *body)
 		case dnsmessage.TypeCNAME:
-			body, _ := (ans.Body).(*dnsmessage.CNAMEResource)
+			body, _ := ans.Body.(*dnsmessage.CNAMEResource)
 			b.CNAMEResource(ans.Header, *body)
 		case dnsmessage.TypeHTTPS:
-			body, _ := (ans.Body).(*dnsmessage.HTTPSResource)
+			body, _ := ans.Body.(*dnsmessage.HTTPSResource)
 			b.HTTPSResource(ans.Header, *body)
 		case dnsmessage.TypeNS:
-			body, _ := (ans.Body).(*dnsmessage.NSResource)
+			body, _ := ans.Body.(*dnsmessage.NSResource)
 			b.NSResource(ans.Header, *body)
 		case dnsmessage.TypeSOA:
-			body, _ := (ans.Body).(*dnsmessage.SOAResource)
+			body, _ := ans.Body.(*dnsmessage.SOAResource)
 			b.SOAResource(ans.Header, *body)
 		case dnsmessage.TypePTR:
-			body, _ := (ans.Body).(*dnsmessage.PTRResource)
+			body, _ := ans.Body.(*dnsmessage.PTRResource)
 			b.PTRResource(ans.Header, *body)
 		case dnsmessage.TypeMX:
-			body, _ := (ans.Body).(*dnsmessage.MXResource)
+			body, _ := ans.Body.(*dnsmessage.MXResource)
 			b.MXResource(ans.Header, *body)
 		case dnsmessage.TypeTXT:
-			body, _ := (ans.Body).(*dnsmessage.TXTResource)
+			body, _ := ans.Body.(*dnsmessage.TXTResource)
 			b.TXTResource(ans.Header, *body)
 		case dnsmessage.TypeSRV:
-			body, _ := (ans.Body).(*dnsmessage.SRVResource)
+			body, _ := ans.Body.(*dnsmessage.SRVResource)
 			b.SRVResource(ans.Header, *body)
 		case dnsmessage.TypeOPT:
-			body, _ := (ans.Body).(*dnsmessage.OPTResource)
+			body, _ := ans.Body.(*dnsmessage.OPTResource)
 			b.OPTResource(ans.Header, *body)
 		case dnsmessage.TypeSVCB:
-			body, _ := (ans.Body).(*dnsmessage.SVCBResource)
+			body, _ := ans.Body.(*dnsmessage.SVCBResource)
 			b.SVCBResource(ans.Header, *body)
 		default:
 			t.Fatalf("unhandled answer type, update test: %v", ans.Header.Type)
@@ -1028,7 +1103,7 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 		t.Fatal(err)
 	}
 	for _, add := range additional {
-		body, ok := (add.Body).(*dnsmessage.AResource)
+		body, ok := add.Body.(*dnsmessage.AResource)
 		if !ok {
 			t.Fatalf("unexpected additional type, update test")
 		}
@@ -1090,6 +1165,24 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 					dst:     netip.MustParseAddr("::2"),
 					magic:   netip.MustParseAddr("fd7a:115c:a1e0:a99c:0::1"),
 					transit: netip.MustParseAddr("fd7a:115c:a1e0:a99c:40::1"),
+					app:     "app1",
+				},
+			},
+		},
+		{
+			name:       "v6-ip-4in6-skipped",
+			appDomains: []string{"example.com"},
+			domain:     "example.com.",
+			v6Addrs: []*dnsmessage.AAAAResource{
+				{AAAA: netip.MustParseAddr("::ffff:1.0.0.1").As16()},
+				{AAAA: netip.MustParseAddr("::1").As16()},
+			},
+			wantByMagicIP: map[netip.Addr]*addrs{
+				netip.MustParseAddr("fd7a:115c:a1e0:a99c::"): {
+					domain:  "example.com.",
+					dst:     netip.MustParseAddr("::1"),
+					magic:   netip.MustParseAddr("fd7a:115c:a1e0:a99c:0::"),
+					transit: netip.MustParseAddr("fd7a:115c:a1e0:a99c:40::"),
 					app:     "app1",
 				},
 			},
@@ -1274,7 +1367,8 @@ func TestMapDNSResponseSetsExpiryBasedOnTTL(t *testing.T) {
 	ipTwo := netip.MustParseAddr("1.0.0.2")
 	ipTooBig := netip.MustParseAddr("1.0.0.3")
 	ipTooSmall := netip.MustParseAddr("1.0.0.4")
-	dnsResp := makeDNSResponseForSections(t,
+	dnsResp := makeDNSResponseForSections(
+		t,
 		[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 		[]dnsmessage.Resource{
 			{
@@ -1317,7 +1411,8 @@ func TestMapDNSResponseSetsExpiryBasedOnTTL(t *testing.T) {
 
 	ipThree := netip.MustParseAddr("::1")
 	ipFour := netip.MustParseAddr("::2")
-	dnsRespV6 := makeDNSResponseForSections(t,
+	dnsRespV6 := makeDNSResponseForSections(
+		t,
 		[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET}},
 		[]dnsmessage.Resource{
 			{
@@ -1344,7 +1439,6 @@ func TestMapDNSResponseSetsExpiryBasedOnTTL(t *testing.T) {
 	// after seeing the addresses again, the expiry time is pushed out.
 	assertExpiresAt(ipThree, clock.Now().Add(301*time.Second))
 	assertExpiresAt(ipFour, clock.Now().Add(61*time.Second))
-
 }
 
 func TestMapDNSResponsePreservesTTL(t *testing.T) {
@@ -1366,7 +1460,8 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 	}{
 		{
 			name: "typeA",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{{
 					Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: wantTTL},
@@ -1377,7 +1472,8 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 		},
 		{
 			name: "typeAAAA",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{{
 					Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: wantTTL},
@@ -1389,7 +1485,8 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 		{
 			// Use the TTL in the A record, not the CNAME.
 			name: "typeA-cname-chain",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -1407,7 +1504,8 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 		{
 			// Use the TTL in the AAAA record, not the CNAME.
 			name: "typeAAAA-cname-chain",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -1424,7 +1522,8 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 		},
 		{
 			name: "typeHTTPS",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeHTTPS, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -1532,7 +1631,6 @@ func TestReserveAddressesDeduplicated(t *testing.T) {
 			if got := len(c.assignments.byDomainDst); got != 1 {
 				t.Errorf("want 1 entry in byDomainDst, got %d", got)
 			}
-
 		})
 	}
 }
@@ -1852,6 +1950,18 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 			),
 		},
 		{
+			name: "ipv6-4in6-answer-dropped",
+			toMap: makeV6DNSResponse(t, domainName, []*dnsmessage.AAAAResource{
+				{AAAA: netip.MustParseAddr("::ffff:1.2.3.4").As16()},
+				{AAAA: netip.MustParseAddr("2606:4700::6812:1a78").As16()},
+			}),
+			assertFx: assertParsesToAnswers(
+				[]netip.Addr{
+					netip.MustParseAddr("2606:4700::6812:100"),
+				},
+			),
+		},
+		{
 			name:     "not-our-domain",
 			toMap:    ipv4ResponseUnhandledDomain,
 			assertFx: assertBytes(ipv4ResponseUnhandledDomain),
@@ -1911,7 +2021,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "not-inet-answer",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{
 					{
 						Name:  dnsMessageName,
@@ -1935,7 +2046,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "answer-domain-mismatch",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{
 					{
 						Name:  dnsMessageName,
@@ -1959,7 +2071,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "answer-type-mismatch-want-v4",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{
 					{
 						Name:  dnsMessageName,
@@ -1991,7 +2104,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "answer-type-mismatch-want-v6",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{
 					{
 						Name:  dnsMessageName,
@@ -2006,7 +2120,7 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 							Type:  dnsmessage.TypeAAAA,
 							Class: dnsmessage.ClassINET,
 						},
-						Body: &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr("1.2.3.4").As16()},
+						Body: &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr("2606:4700::6812:1a78").As16()},
 					},
 					{
 						Header: dnsmessage.ResourceHeader{
@@ -2023,7 +2137,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "cname-resolves-to-magic-ip",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2065,7 +2180,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "cname-aaaa-resolves-to-magic-ip",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{
 					{
 						Name:  dnsMessageName,
@@ -2097,7 +2213,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "cname-broken-chain-skips-answer",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2123,7 +2240,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "cname-multi-source-same-target",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2157,7 +2275,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "cname-has-loop",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2191,7 +2310,8 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 		{
 			name: "https-record-strips-address-hints",
-			toMap: makeDNSResponseForSections(t,
+			toMap: makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeHTTPS, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2279,7 +2399,8 @@ func TestMapDNSResponseDropsUnhandledTypes(t *testing.T) {
 	}
 	for _, tt := range unhandled {
 		t.Run(tt.typ.String(), func(t *testing.T) {
-			toMap := makeDNSResponseForSections(t,
+			toMap := makeDNSResponseForSections(
+				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
@@ -2723,6 +2844,7 @@ func TestConnectorExpireTransitIPs(t *testing.T) {
 	c.reconfig(&config{
 		isConfigured: true,
 		appsByName:   map[string]appctype.Conn25Attr{appName: {}},
+		ipSets:       ipSets{v4Transit: mustIPSetFromPrefix("0.0.0.0/15")},
 	})
 	clock := tstest.NewClock(tstest.ClockOpts{Start: time.Now()})
 	// this would be a data race if we had started the sweeper, but we haven't.
@@ -3024,7 +3146,8 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 	ttlDur := time.Duration(ttlSecs) * time.Second
 
 	ipOne := netip.MustParseAddr("1.0.0.1")
-	dnsRespIPOne := makeDNSResponseForSections(t,
+	dnsRespIPOne := makeDNSResponseForSections(
+		t,
 		[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 		[]dnsmessage.Resource{
 			{
@@ -3036,7 +3159,8 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 	)
 
 	ipTwo := netip.MustParseAddr("1.0.0.2")
-	dnsRespIPTwo := makeDNSResponseForSections(t,
+	dnsRespIPTwo := makeDNSResponseForSections(
+		t,
 		[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 		[]dnsmessage.Resource{
 			{
@@ -3449,24 +3573,31 @@ type fakePeerAPIHandler struct {
 func (fakePeerAPIHandler) Peer() tailcfg.NodeView {
 	panic("unimplemented")
 }
+
 func (m fakePeerAPIHandler) PeerCaps() tailcfg.PeerCapMap {
 	return m.peerCaps
 }
+
 func (fakePeerAPIHandler) CanDebug() bool {
 	panic("unimplemented")
 }
+
 func (fakePeerAPIHandler) Self() tailcfg.NodeView {
 	panic("unimplemented")
 }
+
 func (fakePeerAPIHandler) LocalBackend() *ipnlocal.LocalBackend {
 	panic("unimplemented")
 }
+
 func (fakePeerAPIHandler) IsSelfUntagged() bool {
 	panic("unimplemented")
 }
+
 func (fakePeerAPIHandler) RemoteAddr() netip.AddrPort {
 	panic("unimplemented")
 }
+
 func (fakePeerAPIHandler) Logf(format string, a ...any) {
 	panic("unimplemented")
 }

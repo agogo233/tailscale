@@ -544,11 +544,14 @@ func (c *Conn25) reconfig(cfg *config) {
 	c.client.reconfig()
 }
 
-const dupeTransitIPMessage = "Duplicate transit address in ConnectorTransitIPRequest"
-const noMatchingPeerIPFamilyMessage = "No peer IP found with matching IP family"
-const addrFamilyMismatchMessage = "Transit and Destination addresses must have matching IP family"
-const unknownAppNameMessage = "The App name in the request does not match a configured App"
-const missingAppPermissionMessage = "You do not have permission to use this App"
+const (
+	dupeTransitIPMessage          = "Duplicate transit address in ConnectorTransitIPRequest"
+	noMatchingPeerIPFamilyMessage = "No peer IP found with matching IP family"
+	addrFamilyMismatchMessage     = "Transit and Destination addresses must have matching IP family"
+	unknownAppNameMessage         = "The App name in the request does not match a configured App"
+	missingAppPermissionMessage   = "You do not have permission to use this App"
+	transitIPNotInPoolMessage     = "The transit address is not in a configured transit IP pool"
+)
 
 // handleConnectorTransitIPRequest creates a ConnectorTransitIPResponse in response
 // to a ConnectorTransitIPRequest. It updates the connectors mapping of
@@ -585,6 +588,12 @@ func (c *Conn25) handleConnectorTransitIPRequest(n tailcfg.NodeView, peerCaps ta
 
 	seen := map[netip.Addr]bool{}
 	for _, each := range ctipr.TransitIPs {
+		// Canonicalize IPv4-in-IPv6 addresses, so that duplicate detection and
+		// the keys we store in the connector's map match the unmapped form the
+		// datapath produces when it parses packets.
+		each.TransitIP = each.TransitIP.Unmap()
+		each.DestinationIP = each.DestinationIP.Unmap()
+
 		if seen[each.TransitIP] {
 			resp.TransitIPs = append(resp.TransitIPs, TransitIPResponse{
 				Code:    DuplicateTransitIP,
@@ -624,6 +633,13 @@ func (c *connector) handleTransitIPRequest(n tailcfg.NodeView, peerV4 netip.Addr
 		c.logf("[Unexpected] peer attempt to map a transit IP to dest IP did not have matching families: node: %s, tIPv4: %v dIPv4: %v",
 			n.StableID(), tipr.TransitIP.Is4(), tipr.DestinationIP.Is4())
 		return TransitIPResponse{Code: AddrFamilyMismatch, Message: addrFamilyMismatchMessage}
+	}
+
+	// The transit address has to come from a transit IP pool we're configured with.
+	if !c.transitIPInPool(tipr.TransitIP) {
+		c.logf("[Unexpected] peer attempt to map a transit IP outside of the configured pools: node: %s, IP: %v",
+			n.StableID(), tipr.TransitIP)
+		return TransitIPResponse{Code: TransitIPNotInPool, Message: transitIPNotInPoolMessage}
 	}
 
 	// Datapath lookups only have access to the peer IP, and that will match the family
@@ -719,6 +735,12 @@ const (
 	// MissingAppPermission indicates that the client is not permitted to access
 	// the App name that was specified in the request.
 	MissingAppPermission = 6
+
+	// TransitIPNotInPool indicates that the transit address in the request is
+	// not within a transit IP pool the connector is configured with. A client
+	// which sees this has most likely allocated from a pool configuration that
+	// the connector has not received yet, or has already replaced.
+	TransitIPNotInPool = 7
 )
 
 // TransitIPResponse is the response to a TransitIPRequest
@@ -738,8 +760,10 @@ type ConnectorTransitIPResponse struct {
 	TransitIPs []TransitIPResponse `json:"transitIPs,omitempty"`
 }
 
-const AppConnectorsExperimentalAttrName = "tailscale.com/app-connectors-experimental"
-const AppConnectorsExperimentalIPPoolsAttrName = "tailscale.com/app-connectors-experimental-ippools"
+const (
+	AppConnectorsExperimentalAttrName        = "tailscale.com/app-connectors-experimental"
+	AppConnectorsExperimentalIPPoolsAttrName = "tailscale.com/app-connectors-experimental-ippools"
+)
 
 // ipSets wraps all the IPSets the config needs.
 type ipSets struct {
@@ -1232,6 +1256,12 @@ var (
 	metricDNSResponseRewriteUnsupportedQuestionTypeErrorServfail = clientmetric.NewCounter(
 		"conn25_map_dns_response_rewrite_unsupported_question_type_error_servfail",
 	)
+
+	// metricDNSResponseSkippedAAAA4In6 increments when an AAAA answer for an
+	// app connector domain is dropped because it holds an IPv4-in-IPv6 address.
+	metricDNSResponseSkippedAAAA4In6 = clientmetric.NewCounter(
+		"conn25_map_dns_response_skipped_aaaa_4in6",
+	)
 )
 
 // mapDNSResponse parses and inspects the DNS response. If the domain
@@ -1400,6 +1430,12 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 					return makeServFail(c.logf, hdr, question)
 				}
 				dstAddr = netip.AddrFrom16(r.AAAA)
+
+				// Skip AAAA answer with IPv4-in-IPv6 address.
+				if dstAddr.Is4In6() {
+					metricDNSResponseSkippedAAAA4In6.Add(1)
+					continue
+				}
 			}
 			answers = append(answers, dnsResponseRewrite{domain: queriedDomain, dst: dstAddr, ttlSeconds: h.TTL})
 		default:
@@ -1549,6 +1585,16 @@ func (c *connector) realIPForTransitIPConnection(srcIP netip.Addr, transitIP net
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lookupAddrBySrcIPAndTransitIP(srcIP, transitIP)
+}
+
+// transitIPInPool reports whether tip is within the transit IP pool of its
+// address family that this connector is configured with.
+func (c *connector) transitIPInPool(tip netip.Addr) bool {
+	ipSets := c.getIPSets()
+	if tip.Is4() {
+		return ipSets.v4Transit != nil && ipSets.v4Transit.Contains(tip)
+	}
+	return ipSets.v6Transit != nil && ipSets.v6Transit.Contains(tip)
 }
 
 const packetFilterAllowReason = "app connector transit IP"

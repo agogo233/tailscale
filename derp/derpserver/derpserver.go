@@ -324,10 +324,14 @@ type dupClientSet struct {
 	// data since.
 	last *sclient
 
-	// sendHistory is a log of which members of set have sent
-	// frames to the derp server, with adjacent duplicates
-	// removed. When a member of set is removed, the same
-	// element(s) are removed from sendHistory.
+	// sendHistory records which members of set have sent frames to
+	// the DERP server, ordered from least to most recently active.
+	// Each member appears at most once: recording a member that is
+	// already present moves it to the end instead of appending a
+	// duplicate. That keeps the slice bounded by the size of set.
+	// Without the bound, two connections sharing a key and taking
+	// turns sending could grow it without limit. When a member of
+	// set is removed, it is also removed from sendHistory.
 	sendHistory []*sclient
 }
 
@@ -1017,7 +1021,7 @@ func (s *Server) unregisterClient(c *sclient) {
 	delete(s.keyOfAddr, c.remoteIPPort)
 
 	s.curClients.Add(-1)
-	if c.preferred {
+	if c.preferred.Load() {
 		s.curHomeClients.Add(-1)
 	}
 	if c.isNotIdealConn {
@@ -1278,7 +1282,28 @@ func (c *sclient) run(ctx context.Context) error {
 	}
 }
 
+// maxUnknownFrameLen is the largest declared length of an unknown frame type
+// that the server is willing to read and discard. It is the size of the
+// largest frame a regular (non-mesh) client can send today, a
+// [derp.FrameSendPacket] with a full-size packet, which leaves room for
+// future frame types without letting a client make the server drain an
+// arbitrary amount of data.
+//
+// It must not exceed [minRateLimitTokenBucketSize]: [sclient.rateLimit] charges
+// at most that many tokens per frame on the assumption that any larger frame
+// closes the connection, and this bound is what makes that true for unknown
+// frame types.
+const maxUnknownFrameLen = derp.MaxPacketSize + derp.KeyLen
+
+// handleUnknownFrame discards the body of a frame of a type the server doesn't
+// know, so that newer clients can send new frame types to older servers. It
+// closes the connection if the frame is unreasonably large, since otherwise a
+// client could have the server read (and be charged rate-limit tokens for)
+// far less than the frame's actual length.
 func (c *sclient) handleUnknownFrame(ft derp.FrameType, fl uint32) error {
+	if fl > maxUnknownFrameLen {
+		return fmt.Errorf("unknown frame type %d too large: %d bytes", ft, fl)
+	}
 	_, err := io.CopyN(io.Discard, c.br, int64(fl))
 	return err
 }
@@ -1375,6 +1400,8 @@ func (c *sclient) handleFrameForwardPacket(_ derp.FrameType, fl uint32) error {
 	}
 	contents := *buf
 	s.packetsForwardedIn.Add(1)
+	c.packetsRecv.Add(1)
+	c.bytesRecv.Add(uint64(len(contents)))
 
 	// Use the same lock-free fast path as the local send path. The mesh
 	// forwarder return is intentionally discarded: we never re-forward an
@@ -1448,6 +1475,8 @@ func (c *sclient) handleFrameSendPacket(_ derp.FrameType, fl uint32) error {
 		return fmt.Errorf("client %v: recvPacket: %v", c.key, err)
 	}
 	contents := *buf
+	c.packetsRecv.Add(1)
+	c.bytesRecv.Add(uint64(len(contents)))
 
 	dst, fwd, dstLen := c.lookupDest(dstKey)
 
@@ -1858,7 +1887,14 @@ func (s *Server) noteClientActivity(c *sclient) {
 		}
 	}
 
-	// Append this client to the list of clients who spoke last.
+	// Record c as the most recent sender. If c is already in
+	// sendHistory, remove the earlier occurrence first so that each
+	// member appears at most once and the slice stays bounded by the
+	// number of connections in the set. The LastEqual check above
+	// already handled the case where c is the current tail.
+	if i := slices.Index(dup.sendHistory, c); i >= 0 {
+		dup.sendHistory = slices.Delete(dup.sendHistory, i, i+1)
+	}
 	dup.sendHistory = append(dup.sendHistory, c)
 }
 
@@ -2041,7 +2077,17 @@ type sclient struct {
 	// Owned by run, not thread-safe.
 	br          *bufio.Reader
 	connectedAt time.Time
-	preferred   bool
+
+	// preferred is whether the client reported this server as its
+	// preferred (home) DERP. It's written by run and read by
+	// [Server.ServeDebugClients].
+	preferred atomic.Bool
+
+	// Per-connection traffic counters for [Server.ServeDebugClients].
+	// Like the server-wide counters, they count data packets only,
+	// not frame overhead or other frame types.
+	packetsRecv, bytesRecv atomic.Uint64 // packets this client sent us to deliver or forward
+	packetsSent, bytesSent atomic.Uint64 // packets we wrote to this client
 
 	// Owned by the writer goroutine, not thread-safe. Only one writer
 	// runs at a time, and [sclient.stopWriter] touches these only after
@@ -2228,10 +2274,10 @@ type peerGoneMsg struct {
 }
 
 func (c *sclient) setPreferred(v bool) {
-	if c.preferred == v {
+	if c.preferred.Load() == v {
 		return
 	}
-	c.preferred = v
+	c.preferred.Store(v)
 	var homeMove *expvar.Int
 	if v {
 		c.s.curHomeClients.Add(1)
@@ -2815,6 +2861,8 @@ func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error)
 		} else {
 			c.s.packetsSent.Add(1)
 			c.s.bytesSent.Add(int64(len(contents)))
+			c.packetsSent.Add(1)
+			c.bytesSent.Add(uint64(len(contents)))
 		}
 		if c.debug {
 			c.debugLogf("sendPacket from %s: %v", srcKey.ShortString(), err)
@@ -3196,9 +3244,21 @@ func parseSSOutput(raw string) map[netip.AddrPort]BytesSentRecv {
 	return newState
 }
 
+// debugTrafficFlushSize is the buffered JSON size at which
+// [Server.ServeDebugTraffic] releases the server mutex and writes
+// what it has so far to the network.
+const debugTrafficFlushSize = 32 << 10
+
 func (s *Server) ServeDebugTraffic(w http.ResponseWriter, r *http.Request) {
 	prevState := map[netip.AddrPort]BytesSentRecv{}
-	enc := json.NewEncoder(w)
+
+	// Records are JSON-encoded into buf while holding s.mu, but
+	// are only written to the network with s.mu released, so a
+	// slow client can't stall the server. Rather than toggling
+	// the lock around every record, we let buf grow to
+	// debugTrafficFlushSize before flushing.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	for r.Context().Err() == nil {
 		output, err := exec.Command("ss", "-i", "-H", "-t").Output()
 		if err != nil {
@@ -3221,14 +3281,25 @@ func (s *Server) ServeDebugTraffic(w http.ResponseWriter, r *http.Request) {
 						s.mu.Unlock()
 						return
 					}
+					if buf.Len() >= debugTrafficFlushSize {
+						s.mu.Unlock()
+						_, err := w.Write(buf.Bytes())
+						buf.Reset()
+						if err != nil {
+							return
+						}
+						s.mu.Lock()
+					}
 				}
 			}
 		}
 		s.mu.Unlock()
 		prevState = newState
-		if _, err := fmt.Fprintln(w); err != nil {
+		buf.WriteByte('\n')
+		if _, err := w.Write(buf.Bytes()); err != nil {
 			return
 		}
+		buf.Reset()
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
