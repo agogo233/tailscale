@@ -2295,6 +2295,11 @@ func (b *LocalBackend) applySysPolicyLocked(prefs *ipn.Prefs) (anyChange bool) {
 		anyChange = true
 	}
 
+	if tailnet, err := b.polc.GetString(pkey.Tailnet, prefs.Tailnet); err == nil && prefs.Tailnet != tailnet {
+		prefs.Tailnet = tailnet
+		anyChange = true
+	}
+
 	const sentinel = "HostnameDefaultValue"
 	hostnameFromPolicy, _ := b.polc.GetString(pkey.Hostname, sentinel)
 	switch hostnameFromPolicy {
@@ -3325,6 +3330,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		Persist:              *persistv,
 		ServerURL:            serverURL,
 		AuthKey:              opts.AuthKey,
+		Tailnet:              prefs.Tailnet(),
 		Hostinfo:             b.hostInfoWithServicesLocked(),
 		HTTPTestClient:       httpTestClient,
 		DiscoPublicKey:       discoPublic,
@@ -6105,6 +6111,10 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 		routes  []netip.Prefix
 	)
 	for _, attr := range attrs {
+		// See feature/conn25 for configuration of MagicIP connectors.
+		if attr.Mode != "" && attr.Mode != appctype.Subnet {
+			continue
+		}
 		if slices.Contains(attr.Connectors, "*") || selfHasTag(attr.Connectors) {
 			domains = append(domains, attr.Domains...)
 			routes = append(routes, attr.Routes...)
@@ -8548,12 +8558,21 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 			dm.Resolver().ClearNegativeCache()
 		}
 	}
+	// Snapshot peer keys from the old nodeBackend before swapping it out.
+	oldPeerKeys := b.currentNode().peerNodeKeys()
 	newNode := newNodeBackend(b.ctx, b.logf, b.sys.Bus.Get())
 	if oldNode := b.currentNodeAtomic.Swap(newNode); oldNode != nil {
 		oldNode.shutdown(errNodeContextChanged)
 	}
 	defer newNode.ready()
 	b.setNetMapLocked(nil) // Reset netmap.
+
+	// Use oldPeerKeys to explicitly remove the old tailnet's peers from the
+	// WireGuard device (the peer config is empty so all keys will be removed).
+	for _, k := range oldPeerKeys {
+		b.e.SyncDevicePeer(k)
+	}
+
 	b.updateFilterLocked(ipn.PrefsView{})
 	// Reset the self node in the engine.
 	b.e.SetSelfNode(tailcfg.NodeView{})

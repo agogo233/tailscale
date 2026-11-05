@@ -606,7 +606,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 
 	eventbus.SubscribeFunc(ec, func(update events.DiscoKeyAdvertisement) {
-		e.logf("[v1] wgengine: got TSMP disco key advertisement from %v via eventbus", update.Src)
 		if e.magicConn == nil {
 			e.logf("wgengine: no magicConn")
 			return
@@ -713,6 +712,7 @@ func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
 	if peer, ok := e.wgdev.LookupActivePeer(k.Raw32()); ok {
 		peer.SetPresharedKey(conf.PresharedKey)
 		peer.SetAllowedIPs(conf.AllowedIPs)
+		peer.SetHybridHandshake(conf.Hybrid)
 	}
 }
 

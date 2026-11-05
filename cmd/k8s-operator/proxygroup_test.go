@@ -1051,6 +1051,7 @@ func TestProxyGroup(t *testing.T) {
 	})
 
 	t.Run("scale_down_to_1", func(t *testing.T) {
+		setUnreportedDevice(t, fc, tsClient, pgStateSecretName(pg.Name, 2), "unreported-2")
 		pg.Spec.Replicas = new(int32(1))
 		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
 			p.Spec = pg.Spec
@@ -1086,6 +1087,7 @@ func TestProxyGroup(t *testing.T) {
 	})
 
 	t.Run("delete_and_cleanup", func(t *testing.T) {
+		setUnreportedDevice(t, fc, tsClient, pgStateSecretName(pg.Name, 0), "unreported-0")
 		if err := fc.Delete(t.Context(), pg); err != nil {
 			t.Fatal(err)
 		}
@@ -1098,13 +1100,118 @@ func TestProxyGroup(t *testing.T) {
 		}
 		// 2 nodes should get deleted as part of the scale down, and then finally
 		// the first node gets deleted with the ProxyGroup cleanup.
-		if diff := cmp.Diff(tsClient.deleted, []string{"nodeid-1", "nodeid-2", "nodeid-0"}); diff != "" {
+		if diff := cmp.Diff(tsClient.deleted, []string{"nodeid-1", "unreported-2", "unreported-0"}); diff != "" {
 			t.Fatalf("unexpected deleted devices (-got +want):\n%s", diff)
 		}
 		expectMissing[corev1.Service](t, reconciler, "tailscale", metricsResourceName(pg.Name))
 		// The fake client does not clean up objects whose owner has been
 		// deleted, so we can't test for the owned resources getting deleted.
 	})
+}
+
+// TestProxyGroupDeleteStateSecrets checks that the state Secrets have no owner
+// reference, also when an older operator created them, and that the ProxyGroup
+// cleanup deletes them.
+func TestProxyGroupDeleteStateSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pgType     tsapi.ProxyGroupType
+		proxyClass string
+	}{
+		{
+			name:   "egress",
+			pgType: tsapi.ProxyGroupTypeEgress,
+		},
+		{
+			name:   "kube_apiserver",
+			pgType: tsapi.ProxyGroupTypeKubernetesAPIServer,
+		},
+		{
+			// The reconcile stops at the missing ProxyClass, but it
+			// must still remove the old owner reference.
+			name:       "proxyclass_missing",
+			pgType:     tsapi.ProxyGroupTypeEgress,
+			proxyClass: "missing",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pg := &tsapi.ProxyGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test",
+					UID:        "test-uid",
+					Finalizers: []string{FinalizerName},
+				},
+				Spec: tsapi.ProxyGroupSpec{
+					Type:       tc.pgType,
+					Replicas:   new(int32(2)),
+					ProxyClass: tc.proxyClass,
+				},
+			}
+			if tc.pgType == tsapi.ProxyGroupTypeKubernetesAPIServer {
+				pg.Spec.KubeAPIServer = &tsapi.KubeAPIServerConfig{
+					Mode: new(tsapi.APIServerProxyModeNoAuth),
+				}
+			}
+			// A state Secret created by an older version of the operator,
+			// with an owner reference.
+			oldStateSecret := pgStateSecrets(pg, tsNamespace)[0]
+			oldStateSecret.OwnerReferences = pgOwnerReference(pg)
+
+			fc := fake.NewClientBuilder().
+				WithScheme(tsapi.GlobalScheme).
+				WithObjects(pg, oldStateSecret).
+				WithStatusSubresource(pg).
+				Build()
+			tsClient := &fakeTSClient{}
+			zl, _ := zap.NewDevelopment()
+			reconciler := &ProxyGroupReconciler{
+				tsNamespace:    tsNamespace,
+				tsProxyImage:   testProxyImage,
+				k8sProxyImage:  "tailscale/k8s-proxy:test",
+				defaultTags:    []string{"tag:test-tag"},
+				tsFirewallMode: "auto",
+
+				Client:   fc,
+				clients:  tsclient.NewProvider(tsClient),
+				recorder: record.NewFakeRecorder(10),
+				log:      zl.Sugar(),
+				clock:    tstest.NewClock(tstest.ClockOpts{}),
+				reissuer: tailscaled.NewReissuer(),
+			}
+
+			expectReconciled(t, reconciler, "", pg.Name)
+			var secrets corev1.SecretList
+			if err := fc.List(t.Context(), &secrets, client.InNamespace(tsNamespace), client.MatchingLabels(pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeState))); err != nil {
+				t.Fatal(err)
+			}
+			if len(secrets.Items) != 2 {
+				t.Fatalf("got %d state Secrets, want 2", len(secrets.Items))
+			}
+			for _, s := range secrets.Items {
+				if len(s.OwnerReferences) != 0 {
+					t.Errorf("state Secret %s has owner references %v, want none", s.Name, s.OwnerReferences)
+				}
+			}
+
+			addNodeIDToStateSecrets(t, fc, pg)
+			if err := fc.Delete(t.Context(), pg); err != nil {
+				t.Fatal(err)
+			}
+
+			expectReconciled(t, reconciler, "", pg.Name)
+			expectMissing[tsapi.ProxyGroup](t, fc, "", pg.Name)
+			if diff := cmp.Diff(tsClient.deleted, []string{"nodeid-0", "nodeid-1"}); diff != "" {
+				t.Fatalf("unexpected deleted devices (-got +want):\n%s", diff)
+			}
+			// The config Secrets have an owner reference, and the fake
+			// client does not garbage collect them.
+			var wantSecrets []string
+			if tc.proxyClass == "" {
+				wantSecrets = []string{"test-0-config", "test-1-config"}
+			}
+			expectSecrets(t, fc, wantSecrets)
+		})
+	}
 }
 
 func TestProxyGroupTypes(t *testing.T) {
@@ -2133,13 +2240,13 @@ func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.Prox
 		expectMissing[appsv1.StatefulSet](t, fc, statefulSet.Namespace, statefulSet.Name)
 	}
 
+	// The state Secrets are created before the ProxyClass is checked, so
+	// they exist even when the other resources do not.
 	var expectedSecrets []string
-	if shouldExist {
-		for i := range pgReplicas(pg) {
-			expectedSecrets = append(expectedSecrets,
-				fmt.Sprintf("%s-%d", pg.Name, i),
-				pgConfigSecretName(pg.Name, i),
-			)
+	for i := range pgReplicas(pg) {
+		expectedSecrets = append(expectedSecrets, fmt.Sprintf("%s-%d", pg.Name, i))
+		if shouldExist {
+			expectedSecrets = append(expectedSecrets, pgConfigSecretName(pg.Name, i))
 		}
 	}
 	expectSecrets(t, fc, expectedSecrets)

@@ -3759,13 +3759,38 @@ func TestReconfigureAppConnector(t *testing.T) {
 		t.Fatal("expected app connector")
 	}
 
+	conn25Cfg := `{
+		"name": "example",
+		"domains": ["example.com"],
+		"connectors": ["tag:example"],
+		"mode": "magicip"
+	}`
+
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			Tags: []string{"tag:example"},
+			CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+				"tailscale.com/app-connectors": {tailcfg.RawMessage(conn25Cfg)},
+			}),
+		}).View(),
+	}
+
+	b.currentNode().SetNetMap(nm)
+
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
+	b.appConnector.Wait(context.Background())
+	if b.appConnector.Domains().Len() != 0 {
+		t.Fatalf("expected no configured domains conn25 app")
+	}
+
 	appCfg := `{
 		"name": "example",
 		"domains": ["example.com"],
 		"connectors": ["tag:example"]
 	}`
 
-	nm := &netmap.NetworkMap{
+	nm = &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
 			Tags: []string{"tag:example"},
@@ -4784,6 +4809,53 @@ func TestApplySysPolicy(t *testing.T) {
 			wantAnyChange: true,
 			stringPolicies: map[pkey.Key]string{
 				pkey.ControlURL: "set",
+			},
+		},
+		{
+			name: "Tailnet",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn123",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn123",
+			},
+		},
+		{
+			// The value is passed through verbatim, including a comma-separated
+			// list and a single leading "required:" prefix governing the set.
+			name: "Tailnet-comma-separated-required",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn123,tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn123,tn456",
+			},
+		},
+		{
+			// A comma-separated list without the prefix is a recommendation
+			// over the set, again passed through unchanged.
+			name: "Tailnet-comma-separated-recommended",
+			wantPrefs: ipn.Prefs{
+				Tailnet: "tn123,tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "tn123,tn456",
+			},
+		},
+		{
+			name: "Tailnet-overrides-prefs",
+			prefs: ipn.Prefs{
+				Tailnet: "tn123",
+			},
+			wantPrefs: ipn.Prefs{
+				Tailnet: "required:tn456",
+			},
+			wantAnyChange: true,
+			stringPolicies: map[pkey.Key]string{
+				pkey.Tailnet: "required:tn456",
 			},
 		},
 		{
