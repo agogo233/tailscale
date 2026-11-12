@@ -38,13 +38,13 @@ jobs:
       #     git push "https://${{ github.actor }}:${{ github.token }}@github.com/${{ github.repository }}.git" main
 
 
-      # - name: Delete workflow runs
-      #   uses: Mattraks/delete-workflow-runs@v2
-      #   with:
-      #     token: ${{ github.token }}
-      #     repository: ${{ github.repository }}
-      #     retain_days: 0
-      #     keep_minimum_runs: 3
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
 
       - name: 设置小写镜像名称和版本
         run: |
