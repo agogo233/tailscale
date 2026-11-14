@@ -32,6 +32,8 @@ type client struct {
 
 	// Remember to add new fields to [client.reset] if needed.
 	mu              sync.Mutex // protects the fields below
+	closed          bool
+	generation      uint64 // Current generation ID
 	v4MagicIPPool   *ippool
 	v4TransitIPPool *ippool
 	v6MagicIPPool   *ippool
@@ -90,6 +92,7 @@ func (c *client) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.generation++
 	ipSets := c.getIPSets()
 	c.v4MagicIPPool = newIPPool(ipSets.v4Magic)
 	c.v4TransitIPPool = newIPPool(ipSets.v4Transit)
@@ -97,6 +100,37 @@ func (c *client) reset() {
 	c.v6TransitIPPool = newIPPool(ipSets.v6Transit)
 	c.assignments = addrAssignments{clock: c.assignments.clock}
 	c.byConnKey = nil
+
+	// Drop any assignments still waiting to be sent. They describe the state
+	// we just cleared, so delivering them would register transit IPs with
+	// connectors that this client no longer knows anything about.
+	c.drainAddrsLocked()
+}
+
+// shutdown stops the client from accepting further address assignments and
+// drops any that are still queued.
+func (c *client) shutdown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.closed = true
+	c.drainAddrsLocked()
+	close(c.addrsCh)
+}
+
+// drainAddrsLocked empties the send queue. c.mu must be held, which is what
+// makes the drain complete: senders can't refill the queue behind it.
+func (c *client) drainAddrsLocked() {
+	for {
+		select {
+		case _, ok := <-c.addrsCh:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
 }
 
 // reserveAddresses tries to make an assignment of addrs from the address pools
@@ -185,8 +219,9 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 		return nil, err
 	}
 	as := &addrs{
-		dst:   dst,
-		magic: mip,
+		dst:        dst,
+		magic:      mip,
+		generation: c.generation,
 		connectorAddr: connectorAddr{
 			transit: tip,
 			node:    connectorNode,
@@ -209,21 +244,31 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 	return as, nil
 }
 
-func (c *client) addTransitIPForConnector(tip netip.Addr, conn tailcfg.NodeView) error {
+func (c *client) addTransitIPForConnector(as addrs) error {
+	conn := as.connectorAddr.node
 	if !conn.Valid() {
 		return fmt.Errorf("unexpectedly received invalid connector node")
 	}
 	if conn.Key().IsZero() {
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
-	return c.insertTransitConnMapping(tip, conn.Key())
+	return c.insertTransitConnMapping(as, conn.Key())
 }
 
 // errQueueFull is returned when the address assignment send queue is full and
 // the assignment was dropped. It's backpressure, not a hard failure.
 var errQueueFull = errors.New("queue full")
 
+// errClientShutdown is returned once [client.shutdown] has run and the client
+// no longer accepts address assignments.
+var errClientShutdown = errors.New("conn25 client shut down")
+
+// enqueueAddressAssignment queues addrs to be registered with its connector by
+// sendLoop. c.mu must be held.
 func (c *client) enqueueAddressAssignment(addrs *addrs) error {
+	if c.closed {
+		return errClientShutdown
+	}
 	select {
 	// TODO(fran) investigate the value of waiting for multiple addresses and sending them
 	// in one ConnectorTransitIPRequest
@@ -235,26 +280,30 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	}
 }
 
-func (c *client) flowCreated(transit netip.Addr) {
+func (c *client) flowCreated(transit netip.Addr) func() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.assignments.byTransitIP[transit]
 	if !ok {
-		return
+		return func() {}
 	}
 	entry.activeFlowCount++
-}
-
-func (c *client) flowRemoved(transit netip.Addr) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.assignments.byTransitIP[transit]
-	if !ok {
-		return
-	}
-	entry.activeFlowCount--
-	if entry.activeFlowCount == 0 {
-		entry.zeroFlowTime = c.assignments.clock.Now()
+	var released bool
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		if entry.activeFlowCount <= 0 {
+			c.logf("flow removed for transit %v with no active flows", transit)
+			return
+		}
+		entry.activeFlowCount--
+		if entry.activeFlowCount == 0 {
+			entry.zeroFlowTime = c.assignments.clock.Now()
+		}
 	}
 }
 
@@ -320,6 +369,7 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 type addrs struct {
 	dst             netip.Addr
 	magic           netip.Addr
+	generation      uint64
 	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
 	app             string
@@ -340,12 +390,28 @@ func (as addrs) is6() bool {
 	return as.dst.Is6()
 }
 
-// insertTransitConnMapping adds an entry to the byConnKey map
-// for the provided transitIP (as a prefix).
-// The provided transitIP must already be present in the byTransitIP map.
-func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic) error {
+// errStaleGeneration is returned when an assignment reserved before a
+// [client.reset] is applied after it. The assignment describes state that no
+// longer exists, so it's dropped rather than applied.
+var errStaleGeneration = errors.New("address assignment is from a previous generation")
+
+func (c *client) assignmentIsCurrent(as addrs) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return as.generation == c.generation
+}
+
+// insertTransitConnMapping adds an entry to the byConnKey map
+// for the provided transitIP (as a prefix).
+// The provided assignment must already be present in the byTransitIP map, and
+// must be from the current generation.
+func (c *client) insertTransitConnMapping(as addrs, connKey key.NodePublic) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if as.generation != c.generation {
+		return errStaleGeneration
+	}
+	tip := as.connectorAddr.transit
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}

@@ -4,7 +4,9 @@
 package conn25
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1221,11 +1224,12 @@ var nodeViewComparer = cmp.Comparer(func(a, b tailcfg.NodeView) bool {
 
 func testPeerAPIDoHMeta(t *testing.T, connectorAddr netip.Addr, appName string, tokens map[netip.Addr]string) *resolver.DoHMetadata {
 	t.Helper()
-	u, err := url.Parse(fmt.Sprintf(
-		"http://%s/dns-query?app=%s",
-		netip.AddrPortFrom(connectorAddr, 1234),
-		url.QueryEscape(appName),
-	),
+	u, err := url.Parse(
+		fmt.Sprintf(
+			"http://%s/dns-query?app=%s",
+			netip.AddrPortFrom(connectorAddr, 1234),
+			url.QueryEscape(appName),
+		),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1519,7 +1523,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 				tt.wantByMagicIP,
 				c.client.assignments.byMagicIP,
 				cmp.AllowUnexported(addrs{}, connectorAddr{}),
-				cmpopts.IgnoreFields(addrs{}, "expiresAt"),
+				cmpopts.IgnoreFields(addrs{}, "expiresAt", "generation"),
 				cmpopts.EquateComparable(netip.Addr{}),
 				nodeViewComparer,
 			); diff != "" {
@@ -1881,6 +1885,75 @@ func newTestSafeBackend(t *testing.T) *testSafeBackend {
 
 func (b *testSafeBackend) Sys() *tsd.System { return b.sys }
 
+// TestShutdownDropsLateDNSResponse covers the shutdown ordering in
+// [ipnlocal.LocalBackend]: the extension host is shut down before the engine is
+// closed, and nothing unregisters the hooks that installHooks set on the DNS
+// manager and the tun device. So a DNS response can still reach mapDNSResponse
+// after Shutdown has returned, and that path sends on client.addrsCh. The
+// assignment has to be refused rather than queued for a sendLoop that is gone,
+// and refusing it must not panic the way closing the channel would.
+func TestShutdownDropsLateDNSResponse(t *testing.T) {
+	ext := &extension{
+		conn25:  newConn25(logger.Discard),
+		backend: newTestSafeBackend(t),
+	}
+	if err := ext.Init(&testHost{
+		nb:                &testNodeBackend{peers: []tailcfg.NodeView{testConnectorPeer}},
+		prefs:             testPrefsNotConnector,
+		authReconfigAsync: func() {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ext.conn25.reconfig(mustConfig(t, makeSelfNode(t, []appctype.AppConnectorAttr{{
+		Name:       testAppName,
+		Connectors: []string{"tag:woo"},
+		Domains:    []string{"example.com"},
+		Mode:       appctype.MagicIP,
+	}}, arbitraryPools, nil)))
+
+	if err := ext.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A DNS response that the resolver was already handling when the extension
+	// shut down. This panics with "send on closed channel" if Shutdown closes
+	// the send queue instead of shutting it down from the sending side.
+	out := ext.mapDNSResponse(makeDNSResponse(t, "example.com.", []*dnsmessage.AResource{{A: [4]byte{1, 0, 0, 0}}}))
+
+	// The query can't be answered with a magic IP that no connector will ever
+	// hear about, so it servfails.
+	var p dnsmessage.Parser
+	hdr, err := p.Start(out)
+	if err != nil {
+		t.Fatalf("parsing mapped response: %v", err)
+	}
+	if hdr.RCode != dnsmessage.RCodeServerFailure {
+		t.Errorf("RCode after shutdown: got %v, want %v", hdr.RCode, dnsmessage.RCodeServerFailure)
+	}
+
+	c := ext.conn25.client
+	if got := len(c.assignments.byMagicIP); got != 0 {
+		t.Errorf("want no assignments after shutdown, got %d", got)
+	}
+	if got := len(c.addrsCh); got != 0 {
+		t.Errorf("want nothing queued after shutdown, got %d queued assignments", got)
+	}
+	// The refused reservation has to roll back, not leak its addresses.
+	if got := c.v4MagicIPPool.inUseCount(); got != 0 {
+		t.Errorf("magic pool has %d addresses in use after shutdown, want 0", got)
+	}
+	if got := c.v4TransitIPPool.inUseCount(); got != 0 {
+		t.Errorf("transit pool has %d addresses in use after shutdown, want 0", got)
+	}
+
+	// The profile state change hook is still registered too, and must not
+	// bring the client back to life.
+	c.reset()
+	if _, err := c.reserveAddresses(testAppName, "example.com.", netip.MustParseAddr("1.0.0.0"), 10, testConnectorPeer, ""); !errors.Is(err, errClientShutdown) {
+		t.Errorf("reserveAddresses after reset: got %v, want errClientShutdown", err)
+	}
+}
+
 // TestAddressAssignmentIsHandled tests that after enqueueAddress has been called
 // we handle the assignment asynchronously by:
 //   - making a peerapi request to a peer.
@@ -1974,7 +2047,7 @@ func TestAddressAssignmentIsHandled(t *testing.T) {
 	if err := ext.conn25.client.assignments.insert(as); err != nil {
 		t.Fatalf("error inserting address assignments: %v", err)
 	}
-	ext.conn25.client.enqueueAddressAssignment(as)
+	ext.conn25.client.enqueueAddressAssignmentForTest(as)
 
 	select {
 	case got := <-received:
@@ -2001,6 +2074,121 @@ func TestAddressAssignmentIsHandled(t *testing.T) {
 	case <-authReconfigAsyncCalled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for AuthReconfigAsync to be called")
+	}
+}
+
+// TestHandleAddressAssignmentDropsStaleGeneration covers the check at the top
+// of handleAddressAssignment: an assignment that a [client.reset] invalidated
+// while it was still queued never reaches a connector at all. The same
+// assignment is handled twice, once before the reset as a control and once after it.
+func TestHandleAddressAssignmentDropsStaleGeneration(t *testing.T) {
+	var expectStale atomic.Bool
+	received := make(chan ConnectorTransitIPRequest, 1)
+	connectorPeerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if expectStale.Load() {
+			t.Error("an address assignment from before the reset was sent to the connector")
+			http.Error(w, "stale assignment", http.StatusInternalServerError)
+			return
+		}
+		var req ConnectorTransitIPRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		received <- req
+		json.NewEncoder(w).Encode(ConnectorTransitIPResponse{
+			TransitIPs: []TransitIPResponse{{Code: OK}},
+		})
+	}))
+	defer connectorPeerAPI.Close()
+
+	connectorPeer := (&tailcfg.Node{
+		ID:       tailcfg.NodeID(1),
+		Tags:     []string{"tag:woo"},
+		Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+		Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 1: 0xff, 31: 0x01})),
+		Online:   new(true),
+	}).View()
+
+	ext := &extension{
+		conn25:  newConn25(logger.Discard),
+		backend: newTestSafeBackend(t),
+	}
+	authReconfigAsyncCalled := make(chan struct{}, 1)
+	if err := ext.Init(&testHost{
+		nb: &testNodeBackend{
+			peers:       []tailcfg.NodeView{connectorPeer},
+			peerAPIURLs: map[tailcfg.NodeID]string{connectorPeer.ID(): connectorPeerAPI.URL},
+		},
+		prefs: testPrefsNotConnector,
+		authReconfigAsync: func() {
+			authReconfigAsyncCalled <- struct{}{}
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer ext.Shutdown()
+
+	sn := makeSelfNode(t, []appctype.AppConnectorAttr{{
+		Name:       "app1",
+		Connectors: []string{"tag:woo"},
+		Domains:    []string{"example.com"},
+		Mode:       appctype.MagicIP,
+	}}, appctype.Conn25PoolsAttr{}, []string{})
+	ext.conn25.reconfig(mustConfig(t, sn))
+
+	// Build the assignment by hand rather than reserving one, so that it never
+	// goes through addrsCh and sendLoop can't race us for it. That means
+	// stamping the generation ourselves, the way reserveAddresses would have.
+	c := ext.conn25.client
+	as := &addrs{
+		dst:        netip.MustParseAddr("1.2.3.4"),
+		magic:      netip.MustParseAddr("100.64.0.0"),
+		generation: c.currentGeneration(),
+		connectorAddr: connectorAddr{
+			transit: netip.MustParseAddr("169.254.0.1"),
+			node:    connectorPeer,
+			token:   "test-token",
+		},
+		domain: "example.com.",
+		app:    "app1",
+	}
+	if err := c.assignments.insert(as); err != nil {
+		t.Fatalf("error inserting address assignment: %v", err)
+	}
+
+	// Control: at the current generation the assignment is sent and applied.
+	if err := ext.handleAddressAssignment(context.Background(), *as); err != nil {
+		t.Fatalf("handling a current address assignment: %v", err)
+	}
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for connector to receive request")
+	}
+	select {
+	case <-authReconfigAsyncCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for AuthReconfigAsync to be called")
+	}
+	if _, ok := c.lookupTransitIPsByConnKey(connectorPeer.Key()); !ok {
+		t.Fatal("control assignment did not register a transit IP for the connector")
+	}
+
+	// After a reset the same assignment is stale: no request, no mapping, and
+	// no error for sendLoop to surface.
+	expectStale.Store(true)
+	c.reset()
+	if err := ext.handleAddressAssignment(context.Background(), *as); err != nil {
+		t.Errorf("handling an assignment from before the reset: got error %v, want nil", err)
+	}
+	if _, ok := c.lookupTransitIPsByConnKey(connectorPeer.Key()); ok {
+		t.Error("connector from before the reset got transit IPs registered")
+	}
+	select {
+	case <-authReconfigAsyncCalled:
+		t.Error("AuthReconfigAsync called for an assignment from before the reset")
+	default:
 	}
 }
 
@@ -3204,7 +3392,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 			if err := ext.conn25.client.assignments.insert(tt.as); err != nil {
 				t.Fatalf("error inserting address assignment: %v", err)
 			}
-			if err := ext.conn25.client.enqueueAddressAssignment(tt.as); err != nil {
+			if err := ext.conn25.client.enqueueAddressAssignmentForTest(tt.as); err != nil {
 				t.Fatalf("error enqueuing address assignment: %v", err)
 			}
 			select {

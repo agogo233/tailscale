@@ -1,6 +1,6 @@
 module tailscale.com
 
-go 1.27.3
+go 1.27.4
 
 require (
 	filippo.io/mkcert v1.4.4
@@ -86,7 +86,7 @@ require (
 	github.com/jsimonetti/rtnetlink v1.4.2
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/kdomanski/iso9660 v0.4.0
-	github.com/klauspost/compress v1.20.0
+	github.com/klauspost/compress v1.20.2
 	github.com/kortschak/wol v0.0.0-20200729010619-da482cc4850a
 	github.com/mattn/go-colorable v0.1.15
 	github.com/mattn/go-isatty v0.0.24
@@ -126,7 +126,7 @@ require (
 	github.com/tailscale/ts-gokrazy v0.0.0-20260630224145-b83088f2e52e
 	github.com/tailscale/web-client-prebuilt v0.0.0-20260917222731-e0ed2d0d0fea
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
-	github.com/tailscale/wireguard-go v0.0.0-20261102205419-b884e294b6d8
+	github.com/tailscale/wireguard-go v0.0.0-20261110220948-9e10ef9af415
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e
 	github.com/tc-hib/winres v0.3.1
 	github.com/tcnksm/go-httpstat v0.2.0

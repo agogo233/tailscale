@@ -1178,7 +1178,7 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 	if !ok {
 		return "never"
 	}
-	saw := de.lastRecvWG.LoadAtomic()
+	saw := de.lastRecvWG.Load()
 	if saw == 0 {
 		return "never"
 	}
@@ -1753,26 +1753,34 @@ type udpReceiveConfig struct {
 	directBytes, peerRelayBytes     *expvar.Int
 }
 
+const (
+	// readErrRetryDelay paces a [conn.ReceiveFunc]'s read errors.
+	readErrRetryDelay = 100 * time.Millisecond
+
+	// readErrBrokenAfter is how long a [conn.ReceiveFunc] must be failing
+	// before it reports itself broken to [health.Tracker].
+	readErrBrokenAfter = 30 * time.Second
+)
+
 func (c *Conn) mkReceiveFunc(cfg udpReceiveConfig) conn.ReceiveFunc {
 	ruc := cfg.ruc
 	directPacketMetric, peerRelayPacketMetric := cfg.directPackets, cfg.peerRelayPackets
 	directBytesMetric, peerRelayBytesMetric := cfg.directBytes, cfg.peerRelayBytes
 	name := c.receiveName(cfg.family, cfg.socket)
 	healthItem := c.health.ReceiveFuncStats(name)
+	healthItem.SetBroken(false) // in case we inherited health item from a gone Conn
+
+	var readErrsSince time.Time
+
 	// epCache caches an epAddr->endpoint for hot flows.
 	var epCache epAddrEndpointCache
 	var batchingPackets []batching.ReceivedPacket
 
-	return func(slab []byte, packets []conn.ReceivedPacket) (_ int, retErr error) {
+	return func(slab []byte, packets []conn.ReceivedPacket) (int, error) {
 		if buildfeatures.HasHealth && healthItem != nil {
 			healthItem.Enter()
 			defer healthItem.Exit()
 		}
-		defer func() {
-			if retErr != nil && !c.closing.Load() {
-				c.logf("Receive func %s exiting with error: %T, %v", name, retErr, retErr)
-			}
-		}()
 		if ruc == nil {
 			panic("nil RebindingUDPConn")
 		}
@@ -1789,11 +1797,32 @@ func (c *Conn) mkReceiveFunc(cfg udpReceiveConfig) conn.ReceiveFunc {
 				if neterror.PacketWasTruncated(err) {
 					continue
 				}
-				if neterror.IsUDPReadFeedback(err) {
-					metricRecvUDPErrorReachability.Add(1)
-					continue
+				if errors.Is(err, net.ErrClosed) {
+					return 0, err
 				}
-				return 0, err
+				if c.connCtx.Err() != nil {
+					return 0, fmt.Errorf("%w: %w", net.ErrClosed, err)
+				}
+				metricRecvUDPError.Add(1)
+
+				if readErrsSince.IsZero() {
+					readErrsSince = time.Now()
+				}
+				if time.Since(readErrsSince) >= readErrBrokenAfter {
+					healthItem.SetBroken(true)
+				}
+				c.logf("magicsock: %s: read error: %v", name, err)
+
+				select {
+				case <-c.connCtx.Done():
+				case <-time.After(readErrRetryDelay):
+				}
+				continue
+			}
+			if !readErrsSince.IsZero() {
+				c.logf("magicsock: %s: reads recovered after %v", name, time.Since(readErrsSince).Round(time.Millisecond))
+				readErrsSince = time.Time{}
+				healthItem.SetBroken(false)
 			}
 
 			reportToCaller := false
@@ -1925,7 +1954,7 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		ep = de
 	}
 	now := mono.Now()
-	ep.lastRecvUDPAny.StoreAtomic(now)
+	ep.lastRecvUDPAny.Store(now)
 	connNoted := ep.noteRecvActivity(src, now)
 	if buildfeatures.HasNetLog {
 		if update := c.connCounter.Load(); update != nil {
@@ -2262,7 +2291,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		// Record receive time for UDP transport packets.
 		pi, ok := c.peerMap.byEpAddr[src]
 		if ok {
-			pi.ep.lastRecvUDPAny.StoreAtomic(mono.Now())
+			pi.ep.lastRecvUDPAny.Store(mono.Now())
 		}
 	}
 
@@ -4349,8 +4378,8 @@ var (
 	metricSendPeerRelayError  = clientmetric.NewCounter("magicsock_send_peer_relay_error")
 	metricSendDERPError       = clientmetric.NewCounter("magicsock_send_derp_error")
 
-	// UDP reads matching neterror.IsUDPReadFeedback.
-	metricRecvUDPErrorReachability = clientmetric.NewCounter("magicsock_recv_udp_error_reachability")
+	// Total UDP read errors.
+	metricRecvUDPError = clientmetric.NewCounter("magicsock_recv_udp_error")
 
 	// Sends (data)
 	//
@@ -4578,7 +4607,7 @@ func (le *lazyEndpoint) InitiationMessagePublicKey(peerPublicKey [32]byte) {
 		return
 	}
 	now := mono.Now()
-	ep.lastRecvUDPAny.StoreAtomic(now)
+	ep.lastRecvUDPAny.Store(now)
 	ep.noteRecvActivity(le.src, now)
 }
 
