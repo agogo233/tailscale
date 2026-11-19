@@ -356,9 +356,14 @@ type Conn struct {
 	// magicsock could do with any complexity reduction it can get.
 	netInfoLast *tailcfg.NetInfo
 
-	derpMap   *tailcfg.DERPMap                    // nil (or zero regions/nodes) means DERP is disabled
-	self      tailcfg.NodeView                    // from last SetNetworkMap
-	peersByID map[tailcfg.NodeID]tailcfg.NodeView // current peer set, keyed by NodeID. Maintained by SetNetworkMap/UpsertPeer/RemovePeer. Note: per-field NodeMutation patches received in UpdateNetmapDelta are never applied to these snapshots.
+	derpMap *tailcfg.DERPMap // nil (or zero regions/nodes) means DERP is disabled
+	self    tailcfg.NodeView // from last SetNetworkMap
+
+	// peersByID is the current peer set. It is maintained by
+	// [Conn.SetNetworkMap], [Conn.UpsertPeer], and [Conn.RemovePeer],
+	// and [Conn.UpdateNetmapDelta] applies DERP home and endpoints
+	// patches to it. Online and LastSeen patches are not applied.
+	peersByID map[tailcfg.NodeID]tailcfg.NodeView
 
 	filt               *filter.Filter                      // from last SetFilter
 	relayClientEnabled bool                                // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
@@ -392,7 +397,8 @@ type Conn struct {
 	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
 
 	// lastErrRebind tracks the last time a rebind was performed after
-	// experiencing a write error, and is used to throttle the rate of rebinds.
+	// experiencing a read or write error, and is used to throttle the rate of
+	// rebinds.
 	lastErrRebind syncs.AtomicValue[time.Time]
 
 	// appliedDisableUDPGRO and appliedDisableUDPGSO cache the last UDP offload
@@ -1536,7 +1542,22 @@ func (c *Conn) SendTo(flow int, buffs [][]byte, ep conn.Endpoint, offset int) (e
 	}
 	switch ep := ep.(type) {
 	case *endpoint:
-		return ep.send(flow, buffs, offset)
+		forceMirror := false
+		// We want to mirror retried hybrid post-quantum handshakes to DERP even when a
+		// valid UDP path exists, to mitigate against UDP datapaths whose PMTU cannot deliver
+		// the larger hybrid handshake packets.
+		//
+		// The following logic mirrors the entire packet batch if any packet within appears to
+		// be a handshake retry. If the batch contains both transport packets and handshake
+		// packets, this will mirror transport packets that don't strictly need to be mirrored.
+		//
+		// As of 2026-11-05, handshakes are always emitted as a separate batch of length 1 and
+		// not coalesced with transport data, and there are no plans to change that. So,
+		// this logic should precisely mirror handshake retries only.
+		if batchContainsHandshakeRetry(buffs, offset) {
+			forceMirror = true
+		}
+		return ep.send(flow, buffs, offset, forceMirror)
 	case *lazyEndpoint:
 		// A [*lazyEndpoint] may end up on this TX codepath when wireguard-go is
 		// deemed "under handshake load" and ends up transmitting a cookie reply
@@ -1550,6 +1571,17 @@ func (c *Conn) SendTo(flow int, buffs [][]byte, ep conn.Endpoint, offset int) (e
 		return c.pconn4.WriteWireGuardBatchTo(flow, buffs, ep.src, offset)
 	}
 	return nil
+}
+
+// batchContainsHandshakeRetry reports whether the packet batch contains at least one
+// packet that appears to be a retried handshake.
+func batchContainsHandshakeRetry(buffs [][]byte, offset int) bool {
+	for _, b := range buffs {
+		if device.PacketIsRetry(b[offset:]) {
+			return true
+		}
+	}
+	return false
 }
 
 var errConnClosed = errors.New("Conn closed")
@@ -1586,7 +1618,7 @@ func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
 		} else {
-			c.maybeRebindOnError(err)
+			c.maybeRebindOnWriteError(err)
 		}
 	}
 	return err == nil, err
@@ -1605,7 +1637,7 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap
 		} else {
 			metricSendUDPError.Add(1)
 		}
-		c.maybeRebindOnError(err)
+		c.maybeRebindOnWriteError(err)
 	} else {
 		if sent && !isDisco {
 			switch {
@@ -1631,22 +1663,40 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap
 	return
 }
 
-// maybeRebindOnError performs a rebind and restun if the error is one that is
-// known to be healed by a rebind, and the rebind is not throttled.
-func (c *Conn) maybeRebindOnError(err error) {
+// maybeRebindOnWriteError performs a rebind and restun if the error is one that is
+// known to be healed by a rebind, and the rebind is not currently throttled.
+func (c *Conn) maybeRebindOnWriteError(err error) {
 	ok, reason := shouldRebind(err)
 	if !ok {
 		return
 	}
+	c.maybeRebind(reason)
+}
 
-	if c.lastErrRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
-		c.logf("magicsock: performing rebind due to %q", reason)
-		c.lastErrRebind.Store(time.Now())
-		c.Rebind()
-		go c.ReSTUN(reason)
-	} else {
-		c.logf("magicsock: not performing %q rebind due to throttle", reason)
+// maybeRebindOnReadError rebinds and restuns if err indicates the socket is no
+// longer valid and the rebind is not currently throttled.
+func (c *Conn) maybeRebindOnReadError(err error) {
+	if neterror.IsBadSocketError(err) {
+		c.maybeRebind("bad-socket")
 	}
+}
+
+// maybeRebind rebinds and restuns unless c is closing or another error-driven
+// rebind happened within the last errRebindInterval.
+func (c *Conn) maybeRebind(reason string) {
+	if c.closing.Load() {
+		c.logf("magicsock: not performing %q rebind, conn is closing", reason)
+		return
+	}
+	last := c.lastErrRebind.Load()
+	now := time.Now()
+	if now.Sub(last) < errRebindInterval || !c.lastErrRebind.CompareAndSwap(last, now) {
+		c.logf("magicsock: not performing %q rebind due to throttle", reason)
+		return
+	}
+	c.logf("magicsock: performing rebind due to %q", reason)
+	c.Rebind()
+	go c.ReSTUN(reason)
 }
 
 // sendUDPNetcheck sends b via UDP to addr. It is used exclusively by netcheck.
@@ -1754,6 +1804,9 @@ type udpReceiveConfig struct {
 }
 
 const (
+	// errRebindInterval is the minimum time between error-driven rebinds.
+	errRebindInterval = 5 * time.Second
+
 	// readErrRetryDelay paces a [conn.ReceiveFunc]'s read errors.
 	readErrRetryDelay = 100 * time.Millisecond
 
@@ -1812,6 +1865,7 @@ func (c *Conn) mkReceiveFunc(cfg udpReceiveConfig) conn.ReceiveFunc {
 					healthItem.SetBroken(true)
 				}
 				c.logf("magicsock: %s: read error: %v", name, err)
+				c.maybeRebindOnReadError(err)
 
 				select {
 				case <-c.connCtx.Done():
@@ -3912,6 +3966,10 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 	ruc.mu.Lock()
 	defer ruc.mu.Unlock()
 
+	if c.closing.Load() {
+		return net.ErrClosed
+	}
+
 	if !hasUDPTransport {
 		ruc.setConnLocked(nil, c.udpSockets, "", c.controlKnobs)
 		return nil
@@ -4098,13 +4156,39 @@ func simpleDur(d time.Duration) time.Duration {
 // UpdateNetmapDelta applies the given node mutations to the connection's peer
 // state. It must be called synchronously from the caller's goroutine to ensure
 // magicsock has the current state before subsequent operations proceed.
-// Note: It does not apply these mutations to c.peers.
+//
+// DERP home and endpoints mutations are also applied to the c.peersByID
+// snapshots, so that a later full netmap carrying the pre-delta value isn't
+// skipped by the fast path in [Conn.updateNodes] (tailscale/tailscale#22379).
+// Online and LastSeen mutations are not applied, as magicsock doesn't use
+// those fields; leaving them stale only makes that fast path less likely to
+// skip, never wrongly.
 func (c *Conn) UpdateNetmapDelta(muts []netmap.NodeMutation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// patched holds the peers cloned from c.peersByID by this call, so a
+	// peer with multiple mutations is only cloned once.
+	var patched map[tailcfg.NodeID]*tailcfg.Node
+
 	for _, m := range muts {
+		switch m.(type) {
+		case netmap.NodeMutationDERPHome, netmap.NodeMutationEndpoints:
+		default:
+			continue
+		}
 		nodeID := m.NodeIDBeingMutated()
+		n, ok := patched[nodeID]
+		if !ok {
+			if nv, ok := c.peersByID[nodeID]; ok {
+				n = nv.AsStruct()
+				mak.Set(&patched, nodeID, n)
+			}
+		}
+		if n != nil {
+			m.Apply(n)
+		}
+
 		ep, ok := c.peerMap.endpointForNodeID(nodeID)
 		if !ok {
 			continue
@@ -4120,6 +4204,9 @@ func (c *Conn) UpdateNetmapDelta(muts []netmap.NodeMutation) {
 			ep.setEndpointsLocked(views.SliceOf(m.Endpoints))
 			ep.mu.Unlock()
 		}
+	}
+	for nodeID, n := range patched {
+		c.peersByID[nodeID] = n.View()
 	}
 
 	// As of 2026-06-11 we will only get deltas from the control plane, so upon

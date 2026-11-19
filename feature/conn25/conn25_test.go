@@ -1213,6 +1213,7 @@ var testConnectorPeer = (&tailcfg.Node{
 	Addresses: []netip.Prefix{netip.PrefixFrom(testConnectorAddr, testConnectorAddr.BitLen())},
 	Hostinfo:  (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
 	Online:    new(true),
+	Key:       key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x63})),
 }).View()
 
 var nodeViewComparer = cmp.Comparer(func(a, b tailcfg.NodeView) bool {
@@ -2171,7 +2172,7 @@ func TestHandleAddressAssignmentDropsStaleGeneration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for AuthReconfigAsync to be called")
 	}
-	if _, ok := c.lookupTransitIPsByConnKey(connectorPeer.Key()); !ok {
+	if _, ok := c.lookupTransitIPsByConnID(connectorPeer.ID()); !ok {
 		t.Fatal("control assignment did not register a transit IP for the connector")
 	}
 
@@ -2182,7 +2183,7 @@ func TestHandleAddressAssignmentDropsStaleGeneration(t *testing.T) {
 	if err := ext.handleAddressAssignment(context.Background(), *as); err != nil {
 		t.Errorf("handling an assignment from before the reset: got error %v, want nil", err)
 	}
-	if _, ok := c.lookupTransitIPsByConnKey(connectorPeer.Key()); ok {
+	if _, ok := c.lookupTransitIPsByConnID(connectorPeer.ID()); ok {
 		t.Error("connector from before the reset got transit IPs registered")
 	}
 	select {
@@ -3286,7 +3287,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 	ext.conn25.reconfig(cfg)
 
 	type lookup struct {
-		connKey     key.NodePublic
+		connID      tailcfg.NodeID
 		expectedIPs []netip.Prefix
 		expectedOk  bool
 	}
@@ -3317,14 +3318,14 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 			},
 			lookups: []lookup{
 				{
-					connKey: connectorPeers[0].Key(),
+					connID: connectorPeers[0].ID(),
 					expectedIPs: []netip.Prefix{
 						transitIPs[0],
 					},
 					expectedOk: true,
 				},
 				{
-					connKey:     connectorPeers[1].Key(),
+					connID:      connectorPeers[1].ID(),
 					expectedIPs: nil,
 					expectedOk:  false,
 				},
@@ -3344,7 +3345,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 			},
 			lookups: []lookup{
 				{
-					connKey: connectorPeers[0].Key(),
+					connID: connectorPeers[0].ID(),
 					expectedIPs: []netip.Prefix{
 						transitIPs[0],
 						transitIPs[1],
@@ -3367,7 +3368,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 			},
 			lookups: []lookup{
 				{
-					connKey: connectorPeers[0].Key(),
+					connID: connectorPeers[0].ID(),
 					expectedIPs: []netip.Prefix{
 						transitIPs[0],
 						transitIPs[1],
@@ -3375,7 +3376,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 					expectedOk: true,
 				},
 				{
-					connKey: connectorPeers[1].Key(),
+					connID: connectorPeers[1].ID(),
 					expectedIPs: []netip.Prefix{
 						transitIPs[2],
 					},
@@ -3403,7 +3404,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 
 			// Check that each of the lookups behaves as expected
 			for i, lu := range tt.lookups {
-				got, ok := ext.conn25.client.lookupTransitIPsByConnKey(lu.connKey)
+				got, ok := ext.conn25.client.lookupTransitIPsByConnID(lu.connID)
 				if ok != lu.expectedOk {
 					t.Fatalf("unexpected ok result at index %d wanted %v, got %v", i, lu.expectedOk, ok)
 				}
@@ -3416,7 +3417,7 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 	}
 }
 
-func TestClientTransitIPForMagicIP(t *testing.T) {
+func TestClientPrepareNewFlowForMagicIPResolution(t *testing.T) {
 	sn := makeSelfNode(t, []appctype.AppConnectorAttr{{Name: "app1", Mode: appctype.MagicIP}}, appctype.Conn25PoolsAttr{
 		V4MagicIPPool: []netipx.IPRange{v4RangeFrom("0", "10")}, // 100.64.0.0 - 100.64.0.10
 		V6MagicIPPool: []netipx.IPRange{v6RangeFrom("0", "10")},
@@ -3435,74 +3436,141 @@ func TestClientTransitIPForMagicIP(t *testing.T) {
 	v6NonMip := netip.MustParseAddr("fd7a:115c:a1e0:a99c:11::")
 	v6Dst := netip.MustParseAddr("::1")
 
+	// connector is the connector both assignments below are made against.
+	// otherConnector stands in for a different connector, to check that a
+	// Transit IP registered against the wrong peer doesn't count as routable.
+	connector := (&tailcfg.Node{
+		ID:       tailcfg.NodeID(99),
+		Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+		Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x01})),
+	}).View()
+	otherConnector := (&tailcfg.Node{
+		ID:       tailcfg.NodeID(98),
+		Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+		Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x02})),
+	}).View()
+
 	for _, tt := range []struct {
-		name    string
-		mip     netip.Addr
-		wantTip netip.Addr
-		wantErr error
+		name string
+		mip  netip.Addr
+		// registerWith is the connector the assignments are registered against, as [client.addTransitIPForConnector]
+		// would once the connector had acknowledged them.
+		registerWith tailcfg.NodeView
+		wantTip      netip.Addr
+		wantOk       bool
+		wantErr      error
 	}{
 		{
-			name:    "not-a-magic-ip",
-			mip:     nonMip,
-			wantTip: netip.Addr{},
-			wantErr: nil,
+			name:         "not-a-magic-ip",
+			mip:          nonMip,
+			registerWith: connector,
+			wantTip:      netip.Addr{},
+			wantErr:      nil,
 		},
 		{
-			name:    "unmapped-magic-ip",
-			mip:     unmappedMip,
-			wantTip: netip.Addr{},
-			wantErr: ErrUnmappedMagicIP,
+			name:         "unmapped-magic-ip",
+			mip:          unmappedMip,
+			registerWith: connector,
+			wantTip:      netip.Addr{},
+			wantErr:      ErrUnmappedMagicIP,
 		},
 		{
-			name:    "mapped-magic-ip",
+			name:         "mapped-magic-ip",
+			mip:          mappedMip,
+			registerWith: connector,
+			wantTip:      mappedTip,
+			wantOk:       true,
+			wantErr:      nil,
+		},
+		{
+			name:    "mapped-magic-ip-not-registered",
 			mip:     mappedMip,
-			wantTip: mappedTip,
-			wantErr: nil,
-		},
-		{
-			name:    "v6-not-magic",
-			mip:     v6NonMip,
 			wantTip: netip.Addr{},
-			wantErr: nil,
+			wantErr: ErrTransitIPNotRoutable,
 		},
 		{
-			name:    "v6-unmapped-magic-ip",
-			mip:     v6UnmappedMip,
-			wantTip: netip.Addr{},
-			wantErr: ErrUnmappedMagicIP,
+			name:         "mapped-magic-ip-registered-with-other-connector",
+			mip:          mappedMip,
+			registerWith: otherConnector,
+			wantTip:      netip.Addr{},
+			wantErr:      ErrTransitIPNotRoutable,
 		},
 		{
-			name:    "v6-mapped-magic-ip",
+			name:         "v6-not-magic",
+			mip:          v6NonMip,
+			registerWith: connector,
+			wantTip:      netip.Addr{},
+			wantErr:      nil,
+		},
+		{
+			name:         "v6-unmapped-magic-ip",
+			mip:          v6UnmappedMip,
+			registerWith: connector,
+			wantTip:      netip.Addr{},
+			wantErr:      ErrUnmappedMagicIP,
+		},
+		{
+			name:         "v6-mapped-magic-ip",
+			mip:          v6MappedMip,
+			registerWith: connector,
+			wantTip:      v6MappedTip,
+			wantOk:       true,
+			wantErr:      nil,
+		},
+		{
+			name:    "v6-mapped-magic-ip-not-registered",
 			mip:     v6MappedMip,
-			wantTip: v6MappedTip,
-			wantErr: nil,
+			wantTip: netip.Addr{},
+			wantErr: ErrTransitIPNotRoutable,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newConn25(t.Logf)
 			c.reconfig(cfg)
 
-			if err := c.client.assignments.insert(&addrs{
-				magic: mappedMip,
-				connectorAddr: connectorAddr{
-					transit: mappedTip,
+			assignments := []*addrs{
+				{
+					magic: mappedMip,
+					connectorAddr: connectorAddr{
+						transit: mappedTip,
+						node:    connector,
+					},
+					dst:        dst,
+					generation: c.client.currentGeneration(),
 				},
-				dst: dst,
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.client.assignments.insert(&addrs{
-				magic: v6MappedMip,
-				connectorAddr: connectorAddr{
-					transit: v6MappedTip,
+				{
+					magic: v6MappedMip,
+					connectorAddr: connectorAddr{
+						transit: v6MappedTip,
+						node:    connector,
+					},
+					dst:        v6Dst,
+					generation: c.client.currentGeneration(),
 				},
-				dst: v6Dst,
-			}); err != nil {
-				t.Fatal(err)
 			}
-			tip, err := c.ClientTransitIPForMagicIP(tt.mip)
-			if tip != tt.wantTip {
+			for _, as := range assignments {
+				if err := c.client.assignments.insert(as); err != nil {
+					t.Fatal(err)
+				}
+				if !tt.registerWith.Valid() {
+					continue
+				}
+				forConnector := *as
+				forConnector.connectorAddr.node = tt.registerWith
+				if err := c.client.addTransitIPForConnector(forConnector); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ref, ok, err := c.ClientPrepareNewFlowForMagicIP(tt.mip)
+			if ok {
+				defer ref.Release()
+			}
+			if tip := ref.TransitIP(); tip != tt.wantTip {
 				t.Fatalf("checking transit ip: want %v, got %v", tt.wantTip, tip)
+			}
+			if ok != tt.wantOk {
+				t.Fatalf("checking ok: want %v, got %v", tt.wantOk, ok)
 			}
 			if err != tt.wantErr {
 				t.Fatalf("checking error: want %v, got %v", tt.wantErr, err)

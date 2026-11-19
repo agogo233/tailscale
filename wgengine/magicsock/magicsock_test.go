@@ -2460,6 +2460,71 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 	}
 }
 
+// Tests that a full netmap restoring a peer's DERP home and endpoints to
+// their values from before a delta isn't skipped by the updateNodes fast
+// path. See https://github.com/tailscale/tailscale/issues/22379.
+func TestDeltaThenFullNetmapRevert(t *testing.T) {
+	c := newTestConn(t)
+	defer c.Close()
+	c.SetPrivateKey(key.NewNode())
+
+	nodeKey := randNodeKey()
+	peerA := nodeViews([]*tailcfg.Node{{
+		ID: 1, Key: nodeKey, DiscoKey: randDiscoKey(), HomeDERP: 4,
+		Endpoints: eps("192.0.2.1:41641"),
+	}})
+
+	// state returns the peer endpoint's DERP region and endpoints.
+	state := func() string {
+		de, ok := c.peerMap.endpointForNodeKey(nodeKey)
+		if !ok {
+			t.Fatal("no endpoint")
+		}
+		de.mu.Lock()
+		defer de.mu.Unlock()
+		var addrs []string
+		for ap := range de.endpointState {
+			addrs = append(addrs, ap.String())
+		}
+		slices.Sort(addrs)
+		return fmt.Sprintf("derp-%d %v", de.derpAddr.Port(), addrs)
+	}
+
+	c.SetNetworkMap(tailcfg.NodeView{}, peerA)
+	want := "derp-4 [192.0.2.1:41641]"
+	if got := state(); got != want {
+		t.Fatalf("after first netmap: got %q; want %q", got, want)
+	}
+
+	muts, ok := netmap.NodeMutationsFromPatch(&tailcfg.PeerChange{
+		NodeID:     1,
+		DERPRegion: 26,
+		Endpoints:  eps("192.0.2.2:41641"),
+		Online:     new(true),
+	})
+	if !ok {
+		t.Fatal("NodeMutationsFromPatch failed")
+	}
+	c.UpdateNetmapDelta(muts)
+	if got, want := state(), "derp-26 [192.0.2.2:41641]"; got != want {
+		t.Fatalf("after delta: got %q; want %q", got, want)
+	}
+	if peerA[0].HomeDERP() != 4 {
+		t.Fatal("delta mutated the original NodeView")
+	}
+	c.mu.Lock()
+	snap := c.peersByID[1]
+	c.mu.Unlock()
+	if snap.Online().Valid() {
+		t.Error("Online mutation unexpectedly applied to snapshot")
+	}
+
+	c.SetNetworkMap(tailcfg.NodeView{}, peerA)
+	if got := state(); got != want {
+		t.Fatalf("after reverting netmap: got %q; want %q", got, want)
+	}
+}
+
 // Tests that the full-set peer update path (SetNetworkMap) and the
 // incremental per-peer paths (UpsertPeer, RemovePeer) maintain the
 // node-key-keyed DERP state (derpRoute and peerLastDerp) identically
@@ -3197,7 +3262,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 			for _, epd := range test.ep {
 				endpoint.endpointState[epd.addrPort] = &endpointState{}
 			}
-			udpAddr, _, shouldPing := endpoint.addrForSendLocked(testTime)
+			udpAddr, _, shouldPing := endpoint.addrForSendLocked(testTime, false)
 			if udpAddr.ap.IsValid() != test.validAddr {
 				t.Errorf("udpAddr validity is incorrect; got %v, want %v", udpAddr.ap.IsValid(), test.validAddr)
 			}
@@ -3224,7 +3289,7 @@ func TestAddrForSendLockedForWireGuardOnly(t *testing.T) {
 				state.recentPong = 0
 			}
 
-			udpAddr, _, shouldPing = endpoint.addrForSendLocked(secondPingTime)
+			udpAddr, _, shouldPing = endpoint.addrForSendLocked(secondPingTime, false)
 			if udpAddr != test.want {
 				t.Errorf("udpAddr returned is not expected: got %v, want %v", udpAddr, test.want)
 			}
@@ -3522,7 +3587,7 @@ func TestShouldRebind(t *testing.T) {
 	}
 }
 
-func TestMaybeRebindOnError(t *testing.T) {
+func TestMaybeRebindOnWriteError(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
 
@@ -3541,7 +3606,7 @@ func TestMaybeRebindOnError(t *testing.T) {
 			defer conn.Close()
 
 			before := metricRebindCalls.Value()
-			conn.maybeRebindOnError(rebindErr)
+			conn.maybeRebindOnWriteError(rebindErr)
 			after := metricRebindCalls.Value()
 			if before+1 != after {
 				t.Errorf("should rebind on %#v", rebindErr)
@@ -3558,7 +3623,7 @@ func TestMaybeRebindOnError(t *testing.T) {
 				lastRebindTime := time.Now().Add(-1 * time.Second)
 				conn.lastErrRebind.Store(lastRebindTime)
 				before := metricRebindCalls.Value()
-				conn.maybeRebindOnError(err)
+				conn.maybeRebindOnWriteError(err)
 				after := metricRebindCalls.Value()
 				if before != after {
 					t.Errorf("should not rebind within 5 seconds of last")
@@ -3568,7 +3633,7 @@ func TestMaybeRebindOnError(t *testing.T) {
 				// rebind time.
 				time.Sleep(6 * time.Second)
 
-				conn.maybeRebindOnError(err)
+				conn.maybeRebindOnWriteError(err)
 				newTime := conn.lastErrRebind.Load()
 				if newTime == lastRebindTime {
 					t.Errorf("expected a rebind to occur")
@@ -3579,6 +3644,94 @@ func TestMaybeRebindOnError(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestMaybeRebindOnReadError(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	for _, tt := range []struct {
+		errno  error
+		rebind bool
+	}{
+		{syscall.EBADF, runtime.GOOS != "windows"},
+		{syscall.ENOTSOCK, runtime.GOOS != "windows"},
+		{syscall.Errno(10009), runtime.GOOS == "windows"},
+		{syscall.Errno(10038), runtime.GOOS == "windows"},
+		{syscall.ECONNRESET, false},
+	} {
+		t.Run(tt.errno.Error(), func(t *testing.T) {
+			c := newTestConn(t)
+			defer c.Close()
+			before := metricRebindCalls.Value()
+			c.maybeRebindOnReadError(readErr(tt.errno))
+			var want int64
+			if tt.rebind {
+				want = 1
+			}
+			if got := metricRebindCalls.Value() - before; got != want {
+				t.Errorf("rebinds = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestMaybeRebind(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	t.Run("closing", func(t *testing.T) {
+		c := newTestConn(t)
+		defer c.Close()
+		c.closing.Store(true)
+		before := metricRebindCalls.Value()
+		c.maybeRebind("test")
+		if got := metricRebindCalls.Value() - before; got != 0 {
+			t.Errorf("rebinds = %d, want 0", got)
+		}
+		if !c.lastErrRebind.Load().IsZero() {
+			t.Error("lastErrRebind updated while closing")
+		}
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		c := newTestConn(t)
+		defer c.Close()
+		before := metricRebindCalls.Value()
+		const n = 10
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range n {
+			wg.Go(func() {
+				<-start
+				c.maybeRebind("test")
+			})
+		}
+		close(start)
+		wg.Wait()
+		if got := metricRebindCalls.Value() - before; got != 1 {
+			t.Errorf("%d concurrent maybeRebind calls rebound %d times, want 1", n, got)
+		}
+	})
+}
+
+func TestBindSocketAfterClose(t *testing.T) {
+	c := newTestConn(t)
+	c.Close()
+	for _, tt := range []struct {
+		ruc     *RebindingUDPConn
+		network string
+	}{
+		{&c.pconn4, "udp4"},
+		{&c.pconn6, "udp6"},
+	} {
+		if err := c.bindSocket(tt.ruc, tt.network, keepCurrentPort); !errors.Is(err, net.ErrClosed) {
+			t.Errorf("bindSocket(%s) after Close = %v, want net.ErrClosed", tt.network, err)
+		}
+		if port := tt.ruc.Port(); port != 0 {
+			t.Errorf("%s bound to port %d after Close, want unbound", tt.network, port)
+		}
+	}
 }
 
 func newTestConnAndRegistry(t *testing.T, mod ...func(*Options)) (*Conn, *usermetric.Registry) {

@@ -207,6 +207,8 @@ type watchSession struct {
 	// this session via [Notify.SelfChange]. A change to self is a profile
 	// boundary for implicit bus state, so per-session dedup state such as
 	// lastSentUserProfile must be reset when this identity changes.
+	// It is itself reset on a profile change, as the new profile may
+	// have no self node.
 	lastSentSelf tailcfg.NodeView
 
 	// policyUID is the user ID used for policy snapshot scoping.
@@ -2587,7 +2589,12 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	muts = b.tkaFilterDeltaMutsLocked(muts)
 	needsAuthReconfig := netmapDeltaNeedsAuthReconfig(cn, muts)
 
-	deltaRes, _ := cn.UpdateNetmapDelta(muts)
+	deltaRes, ok := cn.UpdateNetmapDelta(muts)
+	if !ok {
+		// Returning false makes controlclient deliver a full netmap
+		// instead.
+		return false
+	}
 	b.notifyPeerUpdateLocked()
 	b.checkCachedDNSLocked()
 	if buildfeatures.HasDrive {
@@ -2640,6 +2647,13 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 		b.e.SyncDevicePeer(k)
 	}
 	b.setDataPlanePeerRoutes()
+
+	// Sync peers whose handshake type changed. This change takes effect
+	// on the next handshake with this peer, so sync before triggering
+	// handshakes based on disco key changes.
+	for k := range deltaRes.HandshakeTypeChanged {
+		b.e.SyncDevicePeer(k)
+	}
 
 	// Mark the WireGuard session for an opportunistic handshake for peers whose
 	// disco key changed in a way that indicates a restart, flushing their dead
@@ -2934,12 +2948,11 @@ func mutationsAreWorthyOfRecalculatingSuggestedExitNode(muts []netmap.NodeMutati
 			continue
 		}
 
-		// Some exit node is being mutated.  We care about it if it's online
-		// or offline state has changed.  We *might* eventually care about it for other reasons
-		// but for the sake of finding a "better" suggested exit node, this is probably
-		// sufficient.
+		// Some exit node is being mutated.  We care about it if its online
+		// or offline state has changed, or its DERP home, which
+		// [suggestExitNode] uses to group candidates by region.
 		switch m.(type) {
-		case netmap.NodeMutationOnline:
+		case netmap.NodeMutationOnline, netmap.NodeMutationDERPHome:
 			return true
 		}
 	}
@@ -7741,7 +7754,7 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	if nm != nil {
 		login = cmp.Or(profileFromView(nm.UserProfiles[nm.User()]).LoginName, "<missing-profile>")
 	}
-	discoChanged, routeChanged := b.currentNode().SetNetMap(nm)
+	res := b.currentNode().SetNetMap(nm)
 	// A profile reset swaps in a fresh nodeBackend before clearing its map,
 	// so notify on every clear even if this node never received a map.
 	if !b.shutdownCalled && (oldNetMap == nil || nm == nil) {
@@ -7763,16 +7776,24 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 			ms.SetNetworkMap(tailcfg.NodeView{}, nil)
 		}
 	}
+
+	// Sync peers whose handshake type changed. This change takes effect
+	// on the next handshake with this peer, so sync before triggering
+	// handshakes based on disco key changes.
+	for k := range res.HandshakeTypeChanged {
+		b.e.SyncDevicePeer(k)
+	}
+
 	// Reset the WireGuard session for peers whose disco key changed in
 	// a way that indicates a restart, flushing their dead session keys;
 	// each such peer is lazily re-created on demand with current state.
-	for _, k := range discoChanged {
+	for k := range res.DiscoChanged {
 		b.e.MarkDevicePeerForHandshake(k)
 	}
 	// Converge the wireguard-go device for peers whose routes changed
 	// (or that were removed) in the full-netmap resync above; peers not
 	// in routeChanged are already up to date.
-	for k := range routeChanged {
+	for k := range res.ChangedAllowedIPs {
 		b.e.SyncDevicePeer(k)
 	}
 	if login != b.activeLogin {
@@ -8820,6 +8841,14 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 		return nil
 	}
 	b.closeDiskCacheLocked()
+	// IPN bus watchers may drop the old node's implicit bus state
+	// on a profile switch, and the new profile may never deliver
+	// a self node to mark the boundary, such as when the new profile's
+	// node key has expired.
+	for _, sess := range b.notifyWatchers {
+		sess.lastSentUserProfile = nil
+		sess.lastSentSelf = tailcfg.NodeView{}
+	}
 	if buildfeatures.HasDNS {
 		if dm, ok := b.sys.DNSManager.GetOK(); ok {
 			dm.Resolver().ClearNegativeCache()

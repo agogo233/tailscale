@@ -154,7 +154,6 @@
           graphviz
           perl
           go_1_27
-          yarn
 
           # qemu and e2fsprogs are needed for natlab
           qemu
@@ -173,4 +172,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-Ackcupvrl5NqcyZZ7D3X3h/COrZ6Uz/rtxtzeu3ciU8=
+# nix-direnv cache busting line: sha256-ZcegeCjeDDLaX7adwdoxndOjukb4H+JNKHx0xGCWXiQ=
