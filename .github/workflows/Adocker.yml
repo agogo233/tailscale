@@ -75,6 +75,7 @@ jobs:
           context: .
           platforms: linux/amd64  #,linux/arm64 # 指定架构：x86_64 和 ARM64  beta
           push: true
+          provenance: false
           tags: |
             ghcr.io/${{ env.LOWER_NAME }}:beta
 
@@ -85,6 +86,7 @@ jobs:
           context: .
           platforms: linux/amd64  #,linux/arm64 # 指定架构：x86_64 和 ARM64  beta
           push: true
+          provenance: false
           tags: |
             ghcr.io/${{ env.LOWER_NAME }}:latest
 
